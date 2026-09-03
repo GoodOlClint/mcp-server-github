@@ -16,7 +16,7 @@ Phase 1 is `push_verified.py`, a Python CLI spike that proves the semantics and 
 
 1. Resolve `owner/repo` from the remote URL. Refuse remotes that are not `github.com` or that carry userinfo. Transport always uses `https://github.com/<owner>/<repo>.git` with the installation token, whatever scheme the configured remote has; ssh origins are the norm and need no change.
 2. `git fetch origin <base> <branch>`. Compute `range = origin/<branch>..<branch>` if the remote branch exists, else `origin/<base>..<branch>`.
-3. For each commit in the range, oldest first, take the tree diff against its parent: paths, modes, blob hashes. Merge or empty commits: refuse. Read blob contents from the object store, never the working tree. (ADR 0006: modes are carried, not refused.)
+3. For each commit in the range, oldest first (topological), take the tree diff against its first parent: paths, modes, blob hashes. Empty commits: refuse. Merge commits are carried with all parents (ADR 0006). Read blob contents from the object store, never the working tree. (ADR 0006: modes are carried, not refused.)
 4. Mint an installation token (cached until 5 minutes before expiry).
 5. Upload every unique blob in the range once (`POST /git/blobs`), checking the returned SHA equals the local hash.
 6. For each commit: `POST /git/trees` with `base_tree` = the remote parent's tree and the changed entries with their modes (`sha: null` for deletions); `POST /git/commits` with message, tree, and the remote parent, no author or committer. Then one non-force `PATCH /git/refs/heads/<branch>` to the last commit; create the ref at the merge base first if the branch is new. A non-fast-forward rejection is the head race.
@@ -29,7 +29,8 @@ Phase 1 is `push_verified.py`, a Python CLI spike that proves the semantics and 
 |---|---|
 | Remote head moved between fetch and mutation | `expectedHeadOid` mismatch; stop, report the commits already replayed, do not retry automatically |
 | Network failure mid-range | Stop, report the pairs already replayed. A re-run resumes: when the remote branch has commits the local branch lacks, compare them oldest-first against the local range by tree OID and commit message; if every remote-only commit matches a local one in order, adopt them (reset those local commits to the remote OIDs) and continue from the first unmatched local commit. Any mismatch is a refusal ("local branch is behind"). |
-| Merge commit, empty commit, blob over 100 MB | Refuse before the first upload; the whole range is walked first |
+| Empty commit, a parent neither on the remote nor in the range, blob over 100 MB | Refuse before the first upload; the whole range is walked first |
+| Remote has no base branch (empty repository) | Replay from the root commit; create the ref at the first replayed commit |
 | Local branch behind remote | Refuse; the agent has commits it did not push |
 | Nothing to push and the remote branch does not exist | Refuse naming branch and base; no branch is created, so a caller cannot open a PR from a branch that is not there |
 | Diff after replay non-empty | Hard error, local ref untouched |

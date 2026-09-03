@@ -399,8 +399,8 @@ func uploadBlobs(ctx context.Context, c Client, repo *git.Repository, owner, rep
 				return fmt.Errorf("upload blob %s for %s in %s: %w", e.hash, e.path, ch.oid, err)
 			}
 			if got != e.hash.String() {
-				return &RefusedError{OID: ch.oid, Path: e.path, Reason: fmt.Sprintf(
-					"GitHub stored the blob as %s, not the local %s", got, e.hash)}
+				return &SyncError{Reason: fmt.Sprintf(
+					"GitHub stored blob %s for %s in %s as %s; nothing was published", e.hash, e.path, ch.oid, got)}
 			}
 		}
 	}

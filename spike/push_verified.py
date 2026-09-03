@@ -1,7 +1,8 @@
-"""Local-git half of the push_verified spike (P1): range walk, refusal set, local reset.
+"""push_verified spike: replay local commits onto GitHub as Verified commits.
 
-GitHub/auth/GraphQL live in spike/gh.py (P2); spike/push_verified.py main() is
-wired up by P3. See docs/design.md and docs/decisions/0001-0004.
+Range walk, refusal set and local reset live here; GitHub App auth and the
+GraphQL mutations live in spike/gh.py. See docs/design.md and
+docs/decisions/0001-0004.
 """
 
 from __future__ import annotations
@@ -9,10 +10,13 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+import urllib.error
 import urllib.parse
 from dataclasses import dataclass
 
-MAX_COMMIT_BYTES = 40_000_000
+import gh
+
+MAX_COMMIT_BYTES = 7_200_000
 
 _REF_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 _OID_RE = re.compile(r"^[0-9a-fA-F]{4,40}$")
@@ -26,7 +30,15 @@ class RefusedError(Exception):
 
 
 class SyncError(Exception):
-    """The local and remote tips disagree after a fetch; refs left untouched."""
+    """The local and remote tips disagree; refs left untouched.
+
+    `pairs` holds the (local_oid, remote_oid) pairs already replayed when the
+    remote head moved mid-range.
+    """
+
+    def __init__(self, message: str, pairs: list[tuple[str, str]] | None = None):
+        super().__init__(message)
+        self.pairs = pairs or []
 
 
 @dataclass
@@ -50,13 +62,14 @@ def _validate_oid(value: str, label: str) -> None:
 def _redact_url(url: str) -> str:
     if "://" not in url:
         return url
-    parsed = urllib.parse.urlsplit(url)
-    if not (parsed.username or parsed.password):
-        return url
-    netloc = parsed.hostname or ""
-    if parsed.port:
-        netloc = f"{netloc}:{parsed.port}"
-    return urllib.parse.urlunsplit(parsed._replace(netloc=netloc))
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if not (parsed.username or parsed.password):
+            return url
+        netloc = parsed.netloc.rsplit("@", 1)[-1]
+        return urllib.parse.urlunsplit(parsed._replace(netloc=netloc))
+    except ValueError:
+        return "<unparseable url>"
 
 
 def _run(args: list[str], cwd: str, check: bool = True, binary: bool = False):
@@ -70,10 +83,14 @@ def _parse_remote_url(url: str) -> tuple[str, str]:
         m = re.match(r"^[\w.-]+@([^:/]+):(.+)$", url)
         if m:
             return m.group(1), m.group(2)
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.hostname:
-        return parsed.hostname, parsed.path
-    raise RefusedError(f"cannot parse remote url {url!r}")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        hostname = parsed.hostname
+    except ValueError:
+        hostname = None
+    if hostname:
+        return hostname, parsed.path
+    raise RefusedError(f"cannot parse remote url {_redact_url(url)!r}")
 
 
 def owner_repo(repo_path: str, remote: str = "origin") -> tuple[str, str]:
@@ -161,7 +178,7 @@ def commit_changes(repo_path: str, oid: str) -> Change:
 
     additions: list[tuple[str, bytes]] = []
     deletions: list[str] = []
-    total_bytes = 0
+    total_bytes = len(message.encode("utf-8"))
     it = iter(raw_parts)
     for entry_bytes in it:
         try:
@@ -183,12 +200,13 @@ def commit_changes(repo_path: str, oid: str) -> Change:
         src_mode, dst_mode, src_sha, dst_sha, status = fields[:5]
         if dst_mode not in _ALLOWED_MODES:
             raise RefusedError(f"commit {oid} path {path!r} has disallowed dst mode {dst_mode}")
-        if src_mode not in _ALLOWED_MODES:
-            raise RefusedError(f"commit {oid} path {path!r} has disallowed src mode {src_mode}")
 
         if dst_mode == _MODE_MISSING:
             deletions.append(path)
             continue
+
+        if src_mode not in _ALLOWED_MODES:
+            raise RefusedError(f"commit {oid} path {path!r} has disallowed src mode {src_mode}")
 
         blob_result = _run(["git", "cat-file", "blob", dst_sha], cwd=repo_path, binary=True)
         content = blob_result.stdout
@@ -229,12 +247,142 @@ def reset_local_to_remote(repo_path: str, branch: str, remote: str, old_tip: str
         _run(["git", "update-ref", local_ref, remote_ref, old_tip], cwd=repo_path)
 
 
+def _head_oid(repo_path: str, ref: str) -> str:
+    return _run(["git", "rev-parse", ref], cwd=repo_path).stdout.strip()
+
+
+def push(
+    repo_path: str,
+    branch: str,
+    base: str = "main",
+    remote: str = "origin",
+    auth=None,
+    gql=None,
+) -> list[tuple[str, str]]:
+    """Replay `remote/branch..branch` (or `remote/base..branch`) onto GitHub.
+
+    Returns the (local_oid, remote_oid) pairs, oldest first. Every commit in
+    the range is checked before the first mutation, so a refusal sends nothing.
+    """
+    owner, repo = owner_repo(repo_path, remote)
+    oids = commit_range(repo_path, branch, base, remote)
+    if not oids:
+        return []
+
+    changes = [commit_changes(repo_path, oid) for oid in oids]
+    old_tip = _head_oid(repo_path, f"refs/heads/{branch}")
+
+    if gql is None:
+        gql = gh.GraphQL(auth or gh.AppAuth())
+
+    tracked = _run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{branch}"],
+        cwd=repo_path,
+        check=False,
+    ).stdout.strip()
+
+    head = gql.branch_head(owner, repo, branch)
+    if head is None:
+        fork_point = _run(
+            ["git", "merge-base", f"refs/remotes/{remote}/{base}", f"refs/heads/{branch}"],
+            cwd=repo_path,
+        ).stdout.strip()
+        head = gql.create_branch(gql.repo_id(owner, repo), branch, fork_point)
+    elif head != tracked:
+        raise SyncError(
+            f"{remote}/{branch} is at {head}, not the fetched {tracked or '(absent)'}; "
+            "nothing was sent, re-run to recompute the range"
+        )
+
+    pairs: list[tuple[str, str]] = []
+    for change in changes:
+        try:
+            new_oid = gql.create_commit(
+                owner, repo, branch, head, change.message, change.additions, change.deletions
+            )
+        except gh.GraphQLError as exc:
+            if gh.expected_head_mismatch(exc):
+                replayed = ", ".join(f"{local}->{remote_oid}" for local, remote_oid in pairs)
+                raise SyncError(
+                    f"remote {remote}/{branch} head moved during replay of {change.oid}; "
+                    f"already replayed: [{replayed}]",
+                    pairs,
+                ) from exc
+            raise
+        pairs.append((change.oid, new_oid))
+        head = new_oid
+
+    try:
+        reset_local_to_remote(repo_path, branch, remote, old_tip)
+    except SyncError as exc:
+        raise SyncError(str(exc), pairs) from exc
+    return pairs
+
+
+_USAGE = "usage: push_verified.py <repo_path> <branch> [--base main] [--remote origin]"
+
+
+def _parse_args(argv: list[str]) -> tuple[str, str, str, str]:
+    base, remote = "main", "origin"
+    positional: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("--base", "--remote"):
+            if i + 1 >= len(argv):
+                raise ValueError(f"{arg} needs a value")
+            if arg == "--base":
+                base = argv[i + 1]
+            else:
+                remote = argv[i + 1]
+            i += 2
+            continue
+        positional.append(arg)
+        i += 1
+    if len(positional) != 2:
+        raise ValueError("expected <repo_path> <branch>")
+    return positional[0], positional[1], base, remote
+
+
 def main(argv: list[str] | None = None) -> int:
-    print(
-        "usage: push_verified.py <repo_path> <branch> [--base main] [--remote origin]",
-        file=sys.stderr,
-    )
-    return 2
+    argv = sys.argv[1:] if argv is None else argv
+    try:
+        repo_path, branch, base, remote = _parse_args(argv)
+    except ValueError as exc:
+        print(f"{exc}\n{_USAGE}", file=sys.stderr)
+        return 2
+
+    try:
+        pairs = push(repo_path, branch, base=base, remote=remote)
+    except RefusedError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 3
+    except SyncError as exc:
+        print(f"sync error: {exc}", file=sys.stderr)
+        return 4
+    except (gh.AppAuthError, gh.GraphQLError, gh.GraphQLHTTPError) as exc:
+        print(f"github error: {exc}", file=sys.stderr)
+        return 5
+    except urllib.error.URLError as exc:
+        print(f"github request failed: {exc}", file=sys.stderr)
+        return 5
+    except subprocess.CalledProcessError as exc:
+        print(f"git command failed ({exc.returncode}): {' '.join(exc.cmd)}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"cannot run git in {repo_path!r}: {exc.strerror}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"invalid argument: {exc}", file=sys.stderr)
+        return 2
+
+    if not pairs:
+        print("nothing to push")
+        return 0
+    for local_oid, remote_oid in pairs:
+        print(f"{local_oid} -> {remote_oid}")
+    print(f"head {pairs[-1][1]}")
+    return 0
 
 
 if __name__ == "__main__":

@@ -22,8 +22,25 @@ Every push uses the Git Data API and nothing else: one `POST /git/blobs` per uni
 ## Consequences
 
 - Calls per push are unique blobs plus two per commit plus one, against a 5000 per hour limit; trivial at remediation sizes.
-- The per-request ceiling from ADR 0002 no longer applies; the limit is 100 MB per blob. `MaxCommitBytes` stays as a sanity cap and is re-measured.
+- The per-request ceiling from ADR 0002 no longer applies. Measured on `GoodOlClint/PSProxmoxVE` 2026-09-03 (G6, macOS 15.6 / darwin 25.6.0, Go 1.27, residential uplink), the binding limit is per blob and is not the documented 100 MB: `POST /git/blobs` rejects a request whose base64 `content` exceeds 32 MiB with `HTTP 401 Bad credentials`, which is a misleading status for a payload limit. Reproduced with plain `urllib` as well as through the tool, so it is GitHub's, not the client's.
+
+| Blob content | base64 request body | Result |
+|---|---|---|
+| 10 MiB | 14.0 MB | success, 41.0 s / 31.1 s |
+| 20 MiB | 28.0 MB | success, 63.2 s / 206.1 s |
+| 24 MiB | 33.55 MB (32 MiB exactly) | success, 38.3 s |
+| 25 MB | 34.95 MB | HTTP 401, 76 s |
+| 30 MiB | 41.9 MB | HTTP 401, 80 s |
+| 35 MiB | 48.9 MB | HTTP 401, 107 s / 118 s |
+| 40 MiB | 55.9 MB | HTTP 401, 129 s |
+| 50 MiB | 69.9 MB | HTTP 401, 149 s / 168 s / 185 s |
+
+So the per-blob refusal is set to 24 MiB, and a blob over it is refused before anything is sent rather than failing mid-push as a bogus 401. The limit does not bound a commit: a 40 MB commit carried as two 20 MiB blobs succeeded in 60.6 s, so `MaxCommitBytes` stays a per-commit sanity cap and its default is 50 MB.
+
+Push wall times against the 4.8 s GraphQL baseline for the same two-commit, three-file shape: 5.5 s for add + modify + delete over two commits; 9.4 s for three commits covering a chmod, a new 755 script, a symlink and a directory replaced by a file; 0.6 s for a re-run with nothing to push. The extra second over GraphQL buys the modes, and the cost is round trips rather than bytes.
 - The remote OIDs still differ from local (GitHub is the committer), so ADR 0003 stands.
 - ADR 0002's refusal policy is superseded; its deletion carve-out and mode measurements are history. ADR 0001's commit model stands with the transport half replaced.
 - The test fake models blobs, trees, commits, and a fast-forward ref update instead of the mutation.
-- Intermediate commits exist on the remote before the final ref update reaches them; a failure mid-push leaves no ref moved and GitHub garbage-collects the orphans.
+- Intermediate commits exist on the remote before the final ref update reaches them; a failure mid-push leaves no ref moved and GitHub garbage-collects the orphans. A branch the remote does not have is therefore created directly at the replayed tip rather than at the merge base: creating it at the merge base first would publish an empty branch that survives a later failure, which is the outcome `docs/design.md` set out to avoid. `POST /git/refs` returning 422 `Reference already exists` is the new-branch form of the head race and maps to the same typed error as `Update is not a fast forward`.
+- A merge is replayed by mapping each local parent to its remote OID: a parent inside the range is the commit just built for it, a parent outside the range keeps its own OID and is confirmed present with `GET /git/commits/<sha>`; a parent that is neither is a refusal naming it. The tree is built from the remote first parent's tree, and a root commit is created with `parents: []` and no `base_tree` at all. Verified live 2026-09-03: a `git merge --no-ff` replayed with both parents intact and all three commits Verified.
+- Every tree GitHub builds is compared with the tree the local commit names before the next call. `base_tree` is the local parent's tree and the entries carry local blob OIDs, so the result is determined; checking it turns any divergence into a refusal with nothing published, instead of a post-push tree mismatch on a branch that already moved. Verified live against a commit that replaces a directory with a file of the same name.

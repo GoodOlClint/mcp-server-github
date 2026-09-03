@@ -9,52 +9,56 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/GoodOlClint/mcp-server-github/internal/replay"
 )
 
-const defaultEndpoint = "https://api.github.com/graphql"
+const defaultEndpoint = "https://api.github.com"
 const defaultTimeout = 120 * time.Second
-const maxResponseBytes = 10 << 20 // GraphQL responses here are small; caps a misdirected or hostile endpoint.
 
-// GraphQLError carries the "errors" array of a GraphQL response.
-type GraphQLError struct {
-	Errors []struct {
-		Message string
-		Type    string
-		Path    []any
-	}
+// maxResponseBytes caps a misdirected or hostile endpoint; Git Data responses
+// are metadata, the largest being a tree listing.
+const maxResponseBytes = 10 << 20
+
+const apiVersion = "2022-11-28"
+
+// notFastForward is the message GitHub returns when a non-force ref update
+// would not be a fast forward. Confirmed against the live API on 2026-09-03.
+const notFastForward = "not a fast forward"
+
+// referenceAlreadyExists is what a ref create collides with when someone else
+// created the branch first. Confirmed against the live API on 2026-09-03.
+const referenceAlreadyExists = "reference already exists"
+
+// APIError carries a non-2xx REST response.
+type APIError struct {
+	Status  int
+	Message string
+	Body    string
 }
 
-func (e *GraphQLError) Error() string {
-	if len(e.Errors) == 0 {
-		return "github: graphql error"
+func (e *APIError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("github: HTTP %d: %s", e.Status, e.Message)
 	}
-	msgs := make([]string, len(e.Errors))
-	for i, ge := range e.Errors {
-		msgs[i] = ge.Message
-	}
-	return "github: graphql error: " + strings.Join(msgs, "; ")
+	return fmt.Sprintf("github: HTTP %d: %s", e.Status, e.Body)
 }
 
-// Client is a GitHub GraphQL client satisfying replay.Client.
+// Client is a GitHub Git Data REST client satisfying replay.Client.
 type Client struct {
 	httpClient *http.Client
 	endpoint   string
-
-	mu      sync.Mutex
-	repoIDs map[string]string
 }
 
 // Option configures a Client.
 type Option func(*Client)
 
-// WithEndpoint overrides the GraphQL endpoint, for tests.
-func WithEndpoint(url string) Option {
-	return func(c *Client) { c.endpoint = url }
+// WithEndpoint overrides the REST API root, for tests.
+func WithEndpoint(u string) Option {
+	return func(c *Client) { c.endpoint = strings.TrimSuffix(u, "/") }
 }
 
 // WithTimeout overrides the request timeout, default 120s.
@@ -73,7 +77,6 @@ func New(rt http.RoundTripper, opts ...Option) *Client {
 				return http.ErrUseLastResponse
 			},
 		},
-		repoIDs: make(map[string]string),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -81,318 +84,284 @@ func New(rt http.RoundTripper, opts ...Option) *Client {
 	return c
 }
 
-type wireError struct {
-	Message string `json:"message"`
-	Type    string `json:"type"`
-	Path    []any  `json:"path"`
+// pathEscape escapes each segment of a ref or repository name while keeping the
+// separators, so a slash in a branch name stays a path separator. url.PathEscape
+// leaves dot segments alone and GitHub's edge resolves them, so a "." or ".."
+// segment would retarget the request at another repository under the same
+// installation token; reject them here rather than trust the caller.
+func pathEscape(s string) (string, error) {
+	if s == "" {
+		return "", errors.New("github: empty path segment")
+	}
+	parts := strings.Split(s, "/")
+	for i, p := range parts {
+		if p == "" || p == "." || p == ".." {
+			return "", fmt.Errorf("github: %q contains the path segment %q", s, p)
+		}
+		parts[i] = url.PathEscape(p)
+	}
+	return strings.Join(parts, "/"), nil
 }
 
-type envelope struct {
-	Data   json.RawMessage `json:"data"`
-	Errors []wireError     `json:"errors"`
+func (c *Client) repoURL(owner, repo, suffix string) (string, error) {
+	o, err := pathEscape(owner)
+	if err != nil {
+		return "", err
+	}
+	r, err := pathEscape(repo)
+	if err != nil {
+		return "", err
+	}
+	return c.endpoint + "/repos/" + o + "/" + r + "/" + suffix, nil
 }
 
-func (c *Client) do(ctx context.Context, query string, variables map[string]any) (json.RawMessage, error) {
-	body, err := json.Marshal(map[string]any{"query": query, "variables": variables})
+// refURL builds a git/ref or git/refs path for a branch. prefix is the segment
+// before the ref, which differs between reading and writing a ref.
+func (c *Client) refURL(owner, repo, prefix, branch string) (string, error) {
+	b, err := pathEscape(branch)
 	if err != nil {
-		return nil, fmt.Errorf("github: encode graphql request: %w", err)
+		return "", err
+	}
+	return c.repoURL(owner, repo, prefix+"/heads/"+b)
+}
+
+// do issues one request and decodes a JSON body into out, which may be nil.
+func (c *Client) do(ctx context.Context, method, url string, body, out any) error {
+	var reader io.Reader
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("github: encode request: %w", err)
+		}
+		reader = bytes.NewReader(encoded)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, url, reader)
 	if err != nil {
-		return nil, fmt.Errorf("github: build graphql request: %w", err)
+		return fmt.Errorf("github: build request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", apiVersion)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("github: graphql request: %w", err)
+		return fmt.Errorf("github: request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return nil, fmt.Errorf("github: read graphql response: %w", err)
+		return fmt.Errorf("github: read response: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		prefix := respBody
-		if len(prefix) > 500 {
-			prefix = prefix[:500]
-		}
-		return nil, fmt.Errorf("github: graphql request failed: HTTP %d: %s", resp.StatusCode, prefix)
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return newAPIError(resp.StatusCode, respBody)
 	}
-
-	var env envelope
-	if err := json.Unmarshal(respBody, &env); err != nil {
-		return nil, fmt.Errorf("github: decode graphql response: %w", err)
+	if out == nil {
+		return nil
 	}
-
-	if len(env.Errors) > 0 {
-		gqlErr := &GraphQLError{}
-		for _, e := range env.Errors {
-			gqlErr.Errors = append(gqlErr.Errors, struct {
-				Message string
-				Type    string
-				Path    []any
-			}{Message: e.Message, Type: e.Type, Path: e.Path})
-		}
-		return nil, gqlErr
+	if err := json.Unmarshal(respBody, out); err != nil {
+		return fmt.Errorf("github: decode response: %w", err)
 	}
-
-	if len(env.Data) == 0 || string(env.Data) == "null" {
-		prefix := respBody
-		if len(prefix) > 500 {
-			prefix = prefix[:500]
-		}
-		return nil, fmt.Errorf("github: graphql response had no data and no errors: %s", prefix)
-	}
-
-	return env.Data, nil
+	return nil
 }
 
-func (c *Client) repoID(ctx context.Context, owner, repo string) (string, error) {
-	key := owner + "/" + repo
-	c.mu.Lock()
-	id, ok := c.repoIDs[key]
-	c.mu.Unlock()
-	if ok {
-		return id, nil
-	}
-
-	const q = `
-	query($owner: String!, $repo: String!) {
-	  repository(owner: $owner, name: $repo) { id }
-	}
-	`
-	data, err := c.do(ctx, q, map[string]any{"owner": owner, "repo": repo})
-	if err != nil {
-		return "", err
-	}
+func newAPIError(status int, body []byte) *APIError {
 	var parsed struct {
-		Repository struct {
-			ID string `json:"id"`
-		} `json:"repository"`
+		Message string `json:"message"`
 	}
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		return "", fmt.Errorf("github: decode repository id: %w", err)
+	_ = json.Unmarshal(body, &parsed)
+	prefix := body
+	if len(prefix) > 500 {
+		prefix = prefix[:500]
 	}
-	if parsed.Repository.ID == "" {
-		return "", fmt.Errorf("github: repository %s not found or not accessible to this installation", key)
-	}
+	return &APIError{Status: status, Message: parsed.Message, Body: string(prefix)}
+}
 
-	c.mu.Lock()
-	c.repoIDs[key] = parsed.Repository.ID
-	c.mu.Unlock()
-	return parsed.Repository.ID, nil
+type objectRef struct {
+	SHA string `json:"sha"`
 }
 
 // BranchHead returns the OID of refs/heads/branch, or "" when the branch does not exist.
 func (c *Client) BranchHead(ctx context.Context, owner, repo, branch string) (string, error) {
-	const q = `
-	query($owner: String!, $repo: String!, $qualifiedName: String!) {
-	  repository(owner: $owner, name: $repo) {
-	    ref(qualifiedName: $qualifiedName) { target { oid } }
-	  }
-	}
-	`
-	data, err := c.do(ctx, q, map[string]any{
-		"owner":         owner,
-		"repo":          repo,
-		"qualifiedName": "refs/heads/" + branch,
-	})
-	if err != nil {
-		return "", err
-	}
 	var parsed struct {
-		Repository struct {
-			Ref *struct {
-				Target struct {
-					Oid string `json:"oid"`
-				} `json:"target"`
-			} `json:"ref"`
-		} `json:"repository"`
+		Object objectRef `json:"object"`
 	}
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		return "", fmt.Errorf("github: decode branch head: %w", err)
-	}
-	if parsed.Repository.Ref == nil {
-		return "", nil
-	}
-	return parsed.Repository.Ref.Target.Oid, nil
-}
-
-func (c *Client) branchRefID(ctx context.Context, owner, repo, branch string) (string, error) {
-	const q = `
-	query($owner: String!, $repo: String!, $qualifiedName: String!) {
-	  repository(owner: $owner, name: $repo) {
-	    ref(qualifiedName: $qualifiedName) { id }
-	  }
-	}
-	`
-	data, err := c.do(ctx, q, map[string]any{
-		"owner":         owner,
-		"repo":          repo,
-		"qualifiedName": "refs/heads/" + branch,
-	})
+	u, err := c.refURL(owner, repo, "git/ref", branch)
 	if err != nil {
 		return "", err
 	}
-	var parsed struct {
-		Repository struct {
-			Ref *struct {
-				ID string `json:"id"`
-			} `json:"ref"`
-		} `json:"repository"`
-	}
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		return "", fmt.Errorf("github: decode branch ref id: %w", err)
-	}
-	if parsed.Repository.Ref == nil {
-		return "", nil
-	}
-	return parsed.Repository.Ref.ID, nil
-}
-
-// CreateBranch creates refs/heads/branch at fromOID and returns fromOID.
-func (c *Client) CreateBranch(ctx context.Context, owner, repo, branch, fromOID string) (string, error) {
-	repoID, err := c.repoID(ctx, owner, repo)
-	if err != nil {
-		return "", err
-	}
-
-	const m = `
-	mutation($repositoryId: ID!, $name: String!, $oid: GitObjectID!) {
-	  createRef(input: {repositoryId: $repositoryId, name: $name, oid: $oid}) {
-	    ref { target { oid } }
-	  }
-	}
-	`
-	data, err := c.do(ctx, m, map[string]any{
-		"repositoryId": repoID,
-		"name":         "refs/heads/" + branch,
-		"oid":          fromOID,
-	})
-	if err != nil {
-		return "", err
-	}
-	var parsed struct {
-		CreateRef struct {
-			Ref struct {
-				Target struct {
-					Oid string `json:"oid"`
-				} `json:"target"`
-			} `json:"ref"`
-		} `json:"createRef"`
-	}
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		return "", fmt.Errorf("github: decode createRef response: %w", err)
-	}
-	return parsed.CreateRef.Ref.Target.Oid, nil
-}
-
-// CreateCommit issues one createCommitOnBranch and returns the new commit OID.
-func (c *Client) CreateCommit(ctx context.Context, owner, repo, branch, expectedHeadOID, message string, additions []replay.FileAddition, deletions []string) (string, error) {
-	headline, body := splitMessage(message)
-
-	type fileAddition struct {
-		Path     string `json:"path"`
-		Contents string `json:"contents"`
-	}
-	type fileDeletion struct {
-		Path string `json:"path"`
-	}
-
-	wireAdditions := make([]fileAddition, 0, len(additions))
-	for _, a := range additions {
-		wireAdditions = append(wireAdditions, fileAddition{
-			Path:     a.Path,
-			Contents: base64.StdEncoding.EncodeToString(a.Contents),
-		})
-	}
-	wireDeletions := make([]fileDeletion, 0, len(deletions))
-	for _, p := range deletions {
-		wireDeletions = append(wireDeletions, fileDeletion{Path: p})
-	}
-
-	const m = `
-	mutation($input: CreateCommitOnBranchInput!) {
-	  createCommitOnBranch(input: $input) {
-	    commit { oid }
-	  }
-	}
-	`
-	input := map[string]any{
-		"branch": map[string]any{
-			"repositoryNameWithOwner": owner + "/" + repo,
-			"branchName":              branch,
-		},
-		"expectedHeadOid": expectedHeadOID,
-		"message": map[string]any{
-			"headline": headline,
-			"body":     body,
-		},
-		"fileChanges": map[string]any{
-			"additions": wireAdditions,
-			"deletions": wireDeletions,
-		},
-	}
-
-	data, err := c.do(ctx, m, map[string]any{"input": input})
-	if err != nil {
-		var gqlErr *GraphQLError
-		if errors.As(err, &gqlErr) {
-			for _, e := range gqlErr.Errors {
-				if strings.Contains(e.Message, "Expected branch to point to") {
-					return "", &replay.HeadMismatchError{Expected: expectedHeadOID, Message: e.Message}
-				}
-			}
+	if err := c.do(ctx, http.MethodGet, u, nil, &parsed); err != nil {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound {
+			return "", nil
 		}
 		return "", err
 	}
+	return parsed.Object.SHA, nil
+}
 
+// CreateRef creates refs/heads/branch at sha.
+func (c *Client) CreateRef(ctx context.Context, owner, repo, branch, sha string) error {
+	u, err := c.repoURL(owner, repo, "git/refs")
+	if err != nil {
+		return err
+	}
+	body := map[string]any{"ref": "refs/heads/" + branch, "sha": sha}
+	err = c.do(ctx, http.MethodPost, u, body, nil)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.Status == http.StatusUnprocessableEntity &&
+		strings.Contains(strings.ToLower(apiErr.Message), referenceAlreadyExists) {
+		// Someone created the branch between the head read and this call: the
+		// new-branch form of the head race, so the caller can simply re-run.
+		return &replay.HeadMismatchError{Message: apiErr.Message}
+	}
+	return err
+}
+
+// UpdateRef moves refs/heads/branch to sha without force; a rejected
+// non-fast-forward surfaces as *replay.HeadMismatchError.
+func (c *Client) UpdateRef(ctx context.Context, owner, repo, branch, sha string) error {
+	u, err := c.refURL(owner, repo, "git/refs", branch)
+	if err != nil {
+		return err
+	}
+	body := map[string]any{"sha": sha, "force": false}
+	err = c.do(ctx, http.MethodPatch, u, body, nil)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.Status == http.StatusUnprocessableEntity &&
+		strings.Contains(strings.ToLower(apiErr.Message), notFastForward) {
+		return &replay.HeadMismatchError{Message: apiErr.Message}
+	}
+	return err
+}
+
+// CommitTree returns the tree OID of a commit that exists on the remote.
+func (c *Client) CommitTree(ctx context.Context, owner, repo, commitSHA string) (string, error) {
 	var parsed struct {
-		CreateCommitOnBranch struct {
-			Commit struct {
-				Oid string `json:"oid"`
-			} `json:"commit"`
-		} `json:"createCommitOnBranch"`
+		Tree objectRef `json:"tree"`
 	}
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		return "", fmt.Errorf("github: decode createCommitOnBranch response: %w", err)
+	sha, err := pathEscape(commitSHA)
+	if err != nil {
+		return "", err
 	}
-	return parsed.CreateCommitOnBranch.Commit.Oid, nil
+	u, err := c.repoURL(owner, repo, "git/commits/"+sha)
+	if err != nil {
+		return "", err
+	}
+	if err := c.do(ctx, http.MethodGet, u, nil, &parsed); err != nil {
+		return "", err
+	}
+	if parsed.Tree.SHA == "" {
+		return "", fmt.Errorf("github: commit %s carried no tree", commitSHA)
+	}
+	return parsed.Tree.SHA, nil
+}
+
+// CreateBlob uploads raw bytes and returns the blob OID GitHub stored them under.
+func (c *Client) CreateBlob(ctx context.Context, owner, repo string, content []byte) (string, error) {
+	body := map[string]any{
+		"content":  base64.StdEncoding.EncodeToString(content),
+		"encoding": "base64",
+	}
+	u, err := c.repoURL(owner, repo, "git/blobs")
+	if err != nil {
+		return "", err
+	}
+	var parsed objectRef
+	if err := c.do(ctx, http.MethodPost, u, body, &parsed); err != nil {
+		return "", err
+	}
+	if parsed.SHA == "" {
+		return "", errors.New("github: blob response carried no sha")
+	}
+	return parsed.SHA, nil
+}
+
+// entryType is the object type the Git Data API pairs with a mode. An unknown
+// mode is an error rather than a "blob" guess: guessing would send a tree entry
+// that GitHub accepts and stores wrong.
+func entryType(mode string) (string, error) {
+	switch mode {
+	case "100644", "100755", "120000":
+		return "blob", nil
+	case "160000":
+		return "commit", nil
+	}
+	return "", fmt.Errorf("github: unsupported tree entry mode %q", mode)
+}
+
+// CreateTree builds a tree from baseTree with entries applied over it.
+func (c *Client) CreateTree(ctx context.Context, owner, repo, baseTree string,
+	entries []replay.TreeEntry) (string, error) {
+	type wireEntry struct {
+		Path string `json:"path"`
+		Mode string `json:"mode"`
+		Type string `json:"type"`
+		// A deletion is an explicit null. Tagging this omitempty would drop the
+		// key and silently turn every deletion into a no-op.
+		SHA *string `json:"sha"`
+	}
+	wire := make([]wireEntry, 0, len(entries))
+	for _, e := range entries {
+		typ, err := entryType(e.Mode)
+		if err != nil {
+			return "", fmt.Errorf("%w (path %q)", err, e.Path)
+		}
+		wire = append(wire, wireEntry{Path: e.Path, Mode: e.Mode, Type: typ, SHA: e.SHA})
+	}
+	u, err := c.repoURL(owner, repo, "git/trees")
+	if err != nil {
+		return "", err
+	}
+	body := map[string]any{"tree": wire}
+	// A root commit starts from no tree at all; sending an empty base_tree
+	// would be a reference to a tree that does not exist.
+	if baseTree != "" {
+		body["base_tree"] = baseTree
+	}
+	var parsed objectRef
+	if err := c.do(ctx, http.MethodPost, u, body, &parsed); err != nil {
+		return "", err
+	}
+	if parsed.SHA == "" {
+		return "", errors.New("github: tree response carried no sha")
+	}
+	return parsed.SHA, nil
+}
+
+// CreateCommit creates a commit carrying no author or committer field, which is
+// what makes GitHub sign it (ADR 0006).
+func (c *Client) CreateCommit(ctx context.Context, owner, repo, message, tree string,
+	parents []string) (string, error) {
+	if parents == nil {
+		parents = []string{}
+	}
+	u, err := c.repoURL(owner, repo, "git/commits")
+	if err != nil {
+		return "", err
+	}
+	body := map[string]any{"message": message, "tree": tree, "parents": parents}
+	var parsed objectRef
+	if err := c.do(ctx, http.MethodPost, u, body, &parsed); err != nil {
+		return "", err
+	}
+	if parsed.SHA == "" {
+		return "", errors.New("github: commit response carried no sha")
+	}
+	return parsed.SHA, nil
 }
 
 // DeleteBranch deletes refs/heads/branch.
 func (c *Client) DeleteBranch(ctx context.Context, owner, repo, branch string) error {
-	refID, err := c.branchRefID(ctx, owner, repo, branch)
+	u, err := c.refURL(owner, repo, "git/refs", branch)
 	if err != nil {
 		return err
 	}
-	if refID == "" {
-		return fmt.Errorf("github: branch %s/%s@%s does not exist", owner, repo, branch)
-	}
-
-	const m = `
-	mutation($refId: ID!) {
-	  deleteRef(input: {refId: $refId}) {
-	    clientMutationId
-	  }
-	}
-	`
-	_, err = c.do(ctx, m, map[string]any{"refId": refID})
-	return err
-}
-
-func splitMessage(message string) (headline, body string) {
-	parts := strings.SplitN(message, "\n", 2)
-	headline = parts[0]
-	if len(parts) > 1 {
-		body = strings.TrimSpace(parts[1])
-	}
-	return headline, body
+	return c.do(ctx, http.MethodDelete, u, nil, nil)
 }
 
 var _ replay.Client = (*Client)(nil)

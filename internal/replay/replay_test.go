@@ -245,6 +245,24 @@ func flattenTree(t *testing.T, repo *git.Repository, h plumbing.Hash, prefix str
 	}
 }
 
+// flattenTreeEntries renders a tree as a path-to-spec map keeping OIDs rather
+// than contents, so the fake can rebuild a tree without rehashing blobs.
+func flattenTreeEntries(t *testing.T, repo *git.Repository, h plumbing.Hash, prefix string, out map[string]fileSpec) {
+	t.Helper()
+	tree, err := repo.TreeObject(h)
+	if err != nil {
+		t.Fatalf("read tree %s: %v", h, err)
+	}
+	for _, e := range tree.Entries {
+		path := prefix + e.Name
+		if e.Mode == filemode.Dir {
+			flattenTreeEntries(t, repo, e.Hash, path+"/", out)
+			continue
+		}
+		out[path] = fileSpec{mode: e.Mode, hash: e.Hash}
+	}
+}
+
 // -- fixture ---------------------------------------------------------------
 
 type fixture struct {
@@ -361,40 +379,63 @@ func (f *fixture) unserve() {
 // -- fake client -----------------------------------------------------------
 
 // testMaxCommitBytes is the ceiling the tool passes; replay has no default.
-const testMaxCommitBytes int64 = 4_718_592
+const testMaxCommitBytes int64 = 52_428_800
 
+// botSig is the committer GitHub stamps on a Git Data commit, fixed here so the
+// remote OIDs differ from the local ones exactly as they do live.
 var botSig = object.Signature{
-	Name: "Bot", Email: "bot@example.com", When: time.Unix(1500000000, 0).UTC(),
+	Name: "GitHub", Email: "noreply@github.com", When: time.Unix(1500000000, 0).UTC(),
 }
 
 type call struct {
-	kind     string
-	branch   string
-	expected string
-	message  string
+	kind    string
+	branch  string
+	sha     string
+	message string
 }
 
-// fakeClient applies each mutation to the bare remote, so the tree comparison
-// and ref move Push performs afterwards run against a real repository.
+// fakeClient models the Git Data object store and refs of the bare remote, so
+// the tree comparison and ref move Push performs afterwards run against a real
+// repository.
 type fakeClient struct {
-	t           *testing.T
-	remote      *git.Repository
-	calls       []call
-	advanceAt   int
-	advanceNow  bool
-	corrupt     bool
-	failAt      int
-	failWith    error
-	onCreate    func()
-	afterCreate func()
-	creations   int
-	extraCount  int
+	t      *testing.T
+	remote *git.Repository
+	calls  []call
+
+	// advanceNow lands a foreign commit during the next BranchHead;
+	// advanceAt lands one after the Nth CreateCommit, so the ref update that
+	// follows is no longer a fast forward.
+	advanceNow bool
+	advanceAt  int
+	// corrupt makes CreateBlob store bytes other than the ones it was given;
+	// corruptTree adds a path CreateTree was not asked for.
+	corrupt       bool
+	corruptTree   bool
+	failAt        int
+	failWith      error
+	onCreate      func()
+	beforePublish func()
+	afterUpdate   func()
+	blobs         int
+	creations     int
+	extraCount    int
 }
 
 func (f *fakeClient) mutations() int {
 	n := 0
 	for _, c := range f.calls {
-		if c.kind == "create_commit" || c.kind == "create_branch" {
+		switch c.kind {
+		case "create_blob", "create_tree", "create_commit", "create_ref", "update_ref":
+			n++
+		}
+	}
+	return n
+}
+
+func (f *fakeClient) countOf(kind string) int {
+	n := 0
+	for _, c := range f.calls {
+		if c.kind == kind {
 			n++
 		}
 	}
@@ -414,16 +455,100 @@ func (f *fakeClient) BranchHead(_ context.Context, _, _, branch string) (string,
 	return ref.Hash().String(), nil
 }
 
-func (f *fakeClient) CreateBranch(_ context.Context, _, _, branch, fromOID string) (string, error) {
-	f.calls = append(f.calls, call{kind: "create_branch", branch: branch, expected: fromOID})
-	setBranch(f.t, f.remote, branch, plumbing.NewHash(fromOID))
-	return fromOID, nil
+func (f *fakeClient) CreateRef(_ context.Context, _, _, branch, sha string) error {
+	f.calls = append(f.calls, call{kind: "create_ref", branch: branch, sha: sha})
+	if f.beforePublish != nil {
+		hook := f.beforePublish
+		f.beforePublish = nil
+		hook()
+	}
+	if _, err := f.remote.Reference(plumbing.NewBranchReferenceName(branch), true); err == nil {
+		return &HeadMismatchError{Message: "Reference already exists"}
+	}
+	setBranch(f.t, f.remote, branch, plumbing.NewHash(sha))
+	f.fireAfterUpdate()
+	return nil
 }
 
-func (f *fakeClient) CreateCommit(_ context.Context, _, _, branch, expectedHeadOID, message string,
-	additions []FileAddition, deletions []string) (string, error) {
-	f.calls = append(f.calls, call{
-		kind: "create_commit", branch: branch, expected: expectedHeadOID, message: message})
+func (f *fakeClient) fireAfterUpdate() {
+	if f.afterUpdate != nil {
+		hook := f.afterUpdate
+		f.afterUpdate = nil
+		hook()
+	}
+}
+
+func (f *fakeClient) UpdateRef(_ context.Context, _, _, branch, sha string) error {
+	f.calls = append(f.calls, call{kind: "update_ref", branch: branch, sha: sha})
+	head := branchHash(f.t, f.remote, branch)
+	target := plumbing.NewHash(sha)
+	if head != target {
+		hc, err := f.remote.CommitObject(head)
+		if err != nil {
+			return err
+		}
+		tc, err := f.remote.CommitObject(target)
+		if err != nil {
+			return err
+		}
+		fastForward, err := hc.IsAncestor(tc)
+		if err != nil {
+			return err
+		}
+		if !fastForward {
+			return &HeadMismatchError{Message: "Update is not a fast forward"}
+		}
+	}
+	setBranch(f.t, f.remote, branch, target)
+	f.fireAfterUpdate()
+	return nil
+}
+
+func (f *fakeClient) CommitTree(_ context.Context, _, _, commitSHA string) (string, error) {
+	f.calls = append(f.calls, call{kind: "commit_tree", sha: commitSHA})
+	c, err := f.remote.CommitObject(plumbing.NewHash(commitSHA))
+	if err != nil {
+		return "", err
+	}
+	return c.TreeHash.String(), nil
+}
+
+func (f *fakeClient) CreateBlob(_ context.Context, _, _ string, content []byte) (string, error) {
+	f.calls = append(f.calls, call{kind: "create_blob"})
+	f.blobs++
+	if f.corrupt {
+		content = append(append([]byte{}, content...), []byte("corrupt\n")...)
+	}
+	return writeBlob(f.t, f.remote.Storer, content).String(), nil
+}
+
+func (f *fakeClient) CreateTree(_ context.Context, _, _, baseTree string,
+	entries []TreeEntry) (string, error) {
+	f.calls = append(f.calls, call{kind: "create_tree", sha: baseTree})
+	files := map[string]fileSpec{}
+	if baseTree != "" {
+		flattenTreeEntries(f.t, f.remote, plumbing.NewHash(baseTree), "", files)
+	}
+	for _, e := range entries {
+		if e.SHA == nil {
+			delete(files, e.Path)
+			continue
+		}
+		mode, err := modeFromString(e.Mode)
+		if err != nil {
+			return "", err
+		}
+		files[e.Path] = fileSpec{mode: mode, hash: plumbing.NewHash(*e.SHA)}
+	}
+	if f.corruptTree {
+		files["unasked.txt"] = regular("not in any local commit\n")
+	}
+	return writeTree(f.t, f.remote.Storer, files).String(), nil
+}
+
+func (f *fakeClient) CreateCommit(_ context.Context, _, _, message, tree string,
+	parents []string) (string, error) {
+	f.calls = append(f.calls, call{kind: "create_commit", message: message, sha: tree})
 	f.creations++
 	if f.onCreate != nil {
 		f.onCreate()
@@ -431,44 +556,41 @@ func (f *fakeClient) CreateCommit(_ context.Context, _, _, branch, expectedHeadO
 	if f.failAt == f.creations {
 		return "", f.failWith
 	}
+	hashes := make([]plumbing.Hash, 0, len(parents))
+	for _, p := range parents {
+		hashes = append(hashes, plumbing.NewHash(p))
+	}
+	h := writeCommitObject(f.t, f.remote.Storer, botSig, hashes, message, plumbing.NewHash(tree))
 	if f.advanceAt == f.creations {
-		f.advanceRemote(branch)
-	}
-
-	head := branchHash(f.t, f.remote, branch)
-	if head.String() != expectedHeadOID {
-		return "", &HeadMismatchError{Expected: expectedHeadOID,
-			Message: "branch is at " + head.String()}
-	}
-	parent, err := f.remote.CommitObject(head)
-	if err != nil {
-		return "", err
-	}
-	files := map[string]fileSpec{}
-	flattenTree(f.t, f.remote, parent.TreeHash, "", files)
-	for _, d := range deletions {
-		delete(files, d)
-	}
-	for _, a := range additions {
-		content := a.Contents
-		if f.corrupt {
-			content = append(append([]byte{}, content...), []byte("corrupt\n")...)
-		}
-		spec := regularBytes(content)
-		if prev, ok := files[a.Path]; ok {
-			spec.mode = prev.mode
-		}
-		files[a.Path] = spec
-	}
-	tree := writeTree(f.t, f.remote.Storer, files)
-	h := writeCommitObject(f.t, f.remote.Storer, botSig, []plumbing.Hash{head}, message, tree)
-	setBranch(f.t, f.remote, branch, h)
-	if f.afterCreate != nil {
-		hook := f.afterCreate
-		f.afterCreate = nil
-		hook()
+		f.advanceRemote(f.branchOfLastUpdate())
 	}
 	return h.String(), nil
+}
+
+// branchOfLastUpdate names the branch the run is pushing to, taken from the
+// BranchHead call every Push makes before any mutation.
+func (f *fakeClient) branchOfLastUpdate() string {
+	for _, c := range f.calls {
+		if c.kind == "branch_head" {
+			return c.branch
+		}
+	}
+	f.t.Fatal("no branch_head call to take the branch from")
+	return ""
+}
+
+func modeFromString(s string) (filemode.FileMode, error) {
+	switch s {
+	case "100644":
+		return filemode.Regular, nil
+	case "100755":
+		return filemode.Executable, nil
+	case "120000":
+		return filemode.Symlink, nil
+	case "160000":
+		return filemode.Submodule, nil
+	}
+	return filemode.Empty, fmt.Errorf("unknown mode %q", s)
 }
 
 // advanceRemote lands a foreign commit on the remote branch, as a third party
@@ -480,7 +602,7 @@ func (f *fakeClient) advanceRemote(branch string) {
 		f.t.Fatalf("read %s: %v", head, err)
 	}
 	files := map[string]fileSpec{}
-	flattenTree(f.t, f.remote, parent.TreeHash, "", files)
+	flattenTreeEntries(f.t, f.remote, parent.TreeHash, "", files)
 	f.extraCount++
 	files[fmt.Sprintf("foreign%d.txt", f.extraCount)] = regular("foreign\n")
 	tree := writeTree(f.t, f.remote.Storer, files)
@@ -851,6 +973,104 @@ func TestPushRefusesResumeMismatch(t *testing.T) {
 	}
 }
 
+// POST /git/commits takes any number of parents, so a merge is replayed with
+// both: the one inside the range as the OID it was replayed to, the one already
+// on the remote unchanged (ADR 0006).
+func TestPushCarriesAMergeCommitWithBothParents(t *testing.T) {
+	f := newFixture(t)
+	m1 := f.commit(t, "main", []plumbing.Hash{f.seed}, "main moves",
+		map[string]fileSpec{"README.md": regular("seed\n"), "m.txt": regular("m\n")})
+	f.push(t, "main")
+	c1 := f.commit(t, "feature", []plumbing.Hash{f.seed}, "add a",
+		map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("a\n")})
+	merge := f.commit(t, "feature", []plumbing.Hash{c1, m1}, "merge main into feature",
+		map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("a\n"), "m.txt": regular("m\n")})
+
+	fake := newFake(t, f)
+	res, err := Push(context.Background(), fake, f.options("feature"))
+	if err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if len(res.Pairs) != 2 || res.Pairs[1].Local != merge.String() {
+		t.Fatalf("pairs %+v", res.Pairs)
+	}
+	remoteMerge, err := f.remote.CommitObject(plumbing.NewHash(res.Head))
+	if err != nil {
+		t.Fatalf("read remote head: %v", err)
+	}
+	if len(remoteMerge.ParentHashes) != 2 {
+		t.Fatalf("remote merge has %d parents, want 2", len(remoteMerge.ParentHashes))
+	}
+	if got := remoteMerge.ParentHashes[0].String(); got != res.Pairs[0].Remote {
+		t.Errorf("first parent %s, want the replayed %s", got, res.Pairs[0].Remote)
+	}
+	// The second parent was already on the remote, so it keeps its OID.
+	if remoteMerge.ParentHashes[1] != m1 {
+		t.Errorf("second parent %s, want the remote %s", remoteMerge.ParentHashes[1], m1)
+	}
+	localMerge, err := f.local.CommitObject(merge)
+	if err != nil {
+		t.Fatalf("read local merge: %v", err)
+	}
+	if remoteMerge.TreeHash != localMerge.TreeHash {
+		t.Errorf("remote merge tree %s, want the local %s", remoteMerge.TreeHash, localMerge.TreeHash)
+	}
+}
+
+// The first push to a repository with no branches at all replays the branch
+// from its root and creates the ref at the tip.
+func TestPushToARemoteWithNoBranches(t *testing.T) {
+	f := newFixture(t)
+	if err := f.remote.Storer.RemoveReference(plumbing.NewBranchReferenceName("main")); err != nil {
+		t.Fatalf("clear remote refs: %v", err)
+	}
+	c1 := f.commit(t, "feature", []plumbing.Hash{f.seed}, "add a",
+		map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("a\n")})
+
+	fake := newFake(t, f)
+	res, err := Push(context.Background(), fake, f.options("feature"))
+	if err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if len(res.Pairs) != 2 || res.Pairs[0].Local != f.seed.String() || res.Pairs[1].Local != c1.String() {
+		t.Fatalf("want the root and its child replayed, got %+v", res.Pairs)
+	}
+	root, err := f.remote.CommitObject(plumbing.NewHash(res.Pairs[0].Remote))
+	if err != nil {
+		t.Fatalf("read remote root: %v", err)
+	}
+	if len(root.ParentHashes) != 0 {
+		t.Fatalf("remote root has %d parents, want none", len(root.ParentHashes))
+	}
+	if fake.countOf("create_ref") != 1 || fake.countOf("update_ref") != 0 {
+		t.Fatalf("want one create_ref and no update_ref, got %+v", fake.calls)
+	}
+	if branchHash(t, f.remote, "feature").String() != res.Head {
+		t.Fatal("remote branch is not at the replayed tip")
+	}
+	if got := branchHash(t, f.local, "feature").String(); got != res.Head {
+		t.Fatalf("local ref %s, want %s", got, res.Head)
+	}
+}
+
+// A parent that is neither in the range nor already on the remote cannot be
+// mapped, so the commit is refused by name rather than sent with a bad parent.
+func TestRemoteParentsRefusesAnUnknownParent(t *testing.T) {
+	f := newFixture(t)
+	fake := newFake(t, f)
+	missing := plumbing.NewHash("1234567890123456789012345678901234567890")
+	ch := &commitChange{oid: "deadbeef", parents: []plumbing.Hash{missing}}
+
+	_, err := remoteParents(context.Background(), fake, "o", "r", ch, map[plumbing.Hash]string{})
+	var refused *RefusedError
+	if !errors.As(err, &refused) {
+		t.Fatalf("want RefusedError, got %v", err)
+	}
+	if !strings.Contains(refused.Reason, missing.String()) {
+		t.Fatalf("want the parent named in %q", refused.Reason)
+	}
+}
+
 // -- refusals --------------------------------------------------------------
 
 func TestPushRefusals(t *testing.T) {
@@ -865,8 +1085,6 @@ func TestPushRefusals(t *testing.T) {
 		}
 		return out
 	}
-	subHash := "1111111111111111111111111111111111111111"
-
 	cases := []struct {
 		name   string
 		build  func(t *testing.T, f *fixture)
@@ -874,59 +1092,12 @@ func TestPushRefusals(t *testing.T) {
 		max    int64
 	}{
 		{
-			name: "executable addition",
+			name: "empty commit message",
 			build: func(t *testing.T, f *fixture) {
-				f.commit(t, "feature", []plumbing.Hash{f.seed}, "add script",
-					with(map[string]fileSpec{"run.sh": executable("#!/bin/sh\n")}))
+				f.commit(t, "feature", []plumbing.Hash{f.seed}, "",
+					with(map[string]fileSpec{"m.txt": regular("m\n")}))
 			},
-			reason: "executable bit",
-		},
-		{
-			name: "mode change to executable",
-			build: func(t *testing.T, f *fixture) {
-				c1 := f.commit(t, "feature", []plumbing.Hash{f.seed}, "add script",
-					with(map[string]fileSpec{"run.sh": regular("#!/bin/sh\n")}))
-				f.commit(t, "feature", []plumbing.Hash{c1}, "chmod",
-					with(map[string]fileSpec{"run.sh": executable("#!/bin/sh\n")}))
-			},
-			reason: "mode change",
-		},
-		{
-			name: "symlink",
-			build: func(t *testing.T, f *fixture) {
-				f.commit(t, "feature", []plumbing.Hash{f.seed}, "add link",
-					with(map[string]fileSpec{"link.txt": symlink("keep.txt")}))
-			},
-			reason: "not a regular file",
-		},
-		{
-			name: "submodule addition",
-			build: func(t *testing.T, f *fixture) {
-				f.commit(t, "feature", []plumbing.Hash{f.seed}, "add submodule",
-					with(map[string]fileSpec{"vendor/dep": submodule(subHash)}))
-			},
-			reason: "submodule",
-		},
-		{
-			name: "submodule deletion",
-			build: func(t *testing.T, f *fixture) {
-				c1 := f.commit(t, "feature", []plumbing.Hash{f.seed}, "add submodule",
-					with(map[string]fileSpec{"vendor/dep": submodule(subHash)}))
-				f.commit(t, "feature", []plumbing.Hash{c1}, "drop submodule", with(nil))
-			},
-			reason: "submodule",
-		},
-		{
-			name: "merge commit",
-			build: func(t *testing.T, f *fixture) {
-				left := f.commit(t, "left", []plumbing.Hash{f.seed}, "left",
-					with(map[string]fileSpec{"l.txt": regular("l\n")}))
-				right := f.commit(t, "right", []plumbing.Hash{f.seed}, "right",
-					with(map[string]fileSpec{"r.txt": regular("r\n")}))
-				f.commit(t, "feature", []plumbing.Hash{left, right}, "merge",
-					with(map[string]fileSpec{"l.txt": regular("l\n"), "r.txt": regular("r\n")}))
-			},
-			reason: "merge commit",
+			reason: "commit message is empty",
 		},
 		{
 			name: "empty commit",
@@ -943,6 +1114,15 @@ func TestPushRefusals(t *testing.T) {
 			},
 			reason: "exceeds MaxCommitBytes",
 			max:    1024,
+		},
+		{
+			name: "blob over the per-blob upload limit",
+			build: func(t *testing.T, f *fixture) {
+				f.commit(t, "feature", []plumbing.Hash{f.seed}, "add a blob past the upload limit",
+					with(map[string]fileSpec{"huge.bin": regularBytes(make([]byte, maxBlobBytes+1))}))
+			},
+			reason: "over the 25165824 byte per-blob upload limit",
+			max:    maxBlobBytes * 2,
 		},
 		{
 			name: "dot git path",
@@ -1053,9 +1233,10 @@ func TestPushDeletionAndNonUTF8BlobRoundTrip(t *testing.T) {
 
 // -- branch creation, mismatch, re-run, tree check -------------------------
 
-func TestPushCreatesRemoteBranchAtMergeBase(t *testing.T) {
+// A branch the remote lacks is created directly at the replayed tip: one call,
+// and a failure leaves no branch for a caller to open a PR from.
+func TestPushCreatesRemoteBranchAtTheReplayedTip(t *testing.T) {
 	f := newFixture(t)
-	forkPoint := f.seed
 	f.commit(t, "feature", []plumbing.Hash{f.seed}, "add a",
 		map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("a\n")})
 	f.remoteCommit(t, "main", []plumbing.Hash{f.seed}, "main moves",
@@ -1068,55 +1249,101 @@ func TestPushCreatesRemoteBranchAtMergeBase(t *testing.T) {
 	}
 	var created []call
 	for _, c := range fake.calls {
-		if c.kind == "create_branch" {
+		if c.kind == "create_ref" {
 			created = append(created, c)
 		}
 	}
 	if len(created) != 1 {
-		t.Fatalf("want one createBranch, got %d", len(created))
+		t.Fatalf("want one createRef, got %d", len(created))
 	}
-	if created[0].expected != forkPoint.String() {
-		t.Fatalf("branch created at %s, want the merge base %s", created[0].expected, forkPoint)
+	if created[0].sha != res.Head {
+		t.Fatalf("branch created at %s, want the replayed tip %s", created[0].sha, res.Head)
+	}
+	if fake.countOf("update_ref") != 0 {
+		t.Fatal("a new branch needs no separate ref update")
 	}
 	if got := branchHash(t, f.local, "feature").String(); got != res.Head {
 		t.Fatalf("local ref %s, want %s", got, res.Head)
 	}
 }
 
-func TestPushHeadMismatchOnSecondCommitReportsFirstPair(t *testing.T) {
+// A branch that appears between the head read and the create is the new-branch
+// form of the head race, so it must classify as retryable, not as a failure.
+func TestPushNewBranchCollisionIsAHeadRace(t *testing.T) {
 	f := newFixture(t)
 	c1 := f.commit(t, "feature", []plumbing.Hash{f.seed}, "add a",
 		map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("a\n")})
-	c2 := f.commit(t, "feature", []plumbing.Hash{c1}, "add b",
-		map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("a\n"), "b.txt": regular("b\n")})
-	before := branchHash(t, f.local, "feature")
 
 	fake := newFake(t, f)
-	fake.advanceAt = 2
+	fake.beforePublish = func() {
+		setBranch(t, f.remote, "feature", f.seed)
+	}
 	res, err := Push(context.Background(), fake, f.options("feature"))
 
 	var sync *SyncError
 	if !errors.As(err, &sync) {
 		t.Fatalf("want SyncError, got %v", err)
 	}
-	if len(sync.Replayed) != 1 || sync.Replayed[0].Local != c1.String() {
-		t.Fatalf("want commit 1 replayed, got %+v", sync.Replayed)
+	if len(res.Pairs) != 0 {
+		t.Fatalf("want no pairs, got %+v", res.Pairs)
 	}
-	if len(res.Pairs) != 1 || res.Pairs[0] != sync.Replayed[0] {
-		t.Fatalf("result pairs %+v", res.Pairs)
-	}
-	if !strings.Contains(sync.Error(), sync.Replayed[0].Remote) {
-		t.Fatalf("remote OID missing from %q", sync.Error())
-	}
-	if !strings.Contains(sync.Reason, c2.String()) {
-		t.Fatalf("want the stalled commit named in %q", sync.Reason)
-	}
-	if branchHash(t, f.local, "feature") != before {
+	if branchHash(t, f.local, "feature") != c1 {
 		t.Fatal("local ref moved")
 	}
 }
 
-func TestPushWrapsOtherClientErrorsWithPairsSoFar(t *testing.T) {
+// The branch only moves once, at the end, so a head race costs the whole push
+// and lands nothing: the caller must see zero pairs, not a resumable partial.
+func TestPushHeadRaceAtRefUpdateLandsNothing(t *testing.T) {
+	f := newFixture(t)
+	c1 := f.commit(t, "feature", []plumbing.Hash{f.seed}, "add a",
+		map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("a\n")})
+	c2 := f.commit(t, "feature", []plumbing.Hash{c1}, "add b",
+		map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("a\n"), "b.txt": regular("b\n")})
+	f.push(t, "feature")
+	c3 := f.commit(t, "feature", []plumbing.Hash{c2}, "add c",
+		map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("a\n"),
+			"b.txt": regular("b\n"), "c.txt": regular("c\n")})
+	before := branchHash(t, f.local, "feature")
+	remoteBefore := branchHash(t, f.remote, "feature")
+
+	fake := newFake(t, f)
+	fake.advanceAt = 1
+	res, err := Push(context.Background(), fake, f.options("feature"))
+
+	var sync *SyncError
+	if !errors.As(err, &sync) {
+		t.Fatalf("want SyncError, got %v", err)
+	}
+	if len(res.Pairs) != 0 || len(sync.Replayed) != 0 {
+		t.Fatalf("nothing reached the branch, so no pairs: %+v %+v", res.Pairs, sync.Replayed)
+	}
+	if fake.countOf("create_commit") != 1 {
+		t.Fatalf("want the one commit built, got %d", fake.countOf("create_commit"))
+	}
+	// The orphaned commit is named so the operator can find it before GitHub
+	// collects it.
+	built := ""
+	for _, c := range fake.calls {
+		if c.kind == "update_ref" {
+			built = c.sha
+		}
+	}
+	if built == "" || !strings.Contains(sync.Reason, built) {
+		t.Fatalf("want the unreferenced commit %q named in %q", built, sync.Reason)
+	}
+	if branchHash(t, f.local, "feature") != before {
+		t.Fatal("local ref moved")
+	}
+	if branchHash(t, f.remote, "feature") == remoteBefore {
+		t.Fatal("fixture did not move the remote head, so no race was exercised")
+	}
+	_ = c3
+}
+
+// A failure before the ref update leaves the remote branch untouched, so the
+// caller gets no pairs and a plain re-run replaces the orphaned objects.
+func TestPushClientErrorBeforeRefUpdateLandsNothing(t *testing.T) {
 	f := newFixture(t)
 	c1 := f.commit(t, "feature", []plumbing.Hash{f.seed}, "add a",
 		map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("a\n")})
@@ -1136,8 +1363,11 @@ func TestPushWrapsOtherClientErrorsWithPairsSoFar(t *testing.T) {
 	if errors.As(err, &sync) {
 		t.Fatalf("client errors must not become SyncError: %v", err)
 	}
-	if len(res.Pairs) != 1 || res.Pairs[0].Local != c1.String() {
-		t.Fatalf("want commit 1 in the pairs, got %+v", res.Pairs)
+	if len(res.Pairs) != 0 {
+		t.Fatalf("want no pairs, got %+v", res.Pairs)
+	}
+	if fake.countOf("update_ref") != 0 {
+		t.Fatal("the ref must not be touched after a failed commit")
 	}
 }
 
@@ -1168,24 +1398,27 @@ func TestPushRerunAfterSuccessSendsZeroMutations(t *testing.T) {
 	}
 }
 
-func TestPushTreeMismatchLeavesLocalRefAlone(t *testing.T) {
+// A tree that is not the one the local commit names must stop the push before
+// the branch moves, not be noticed by the tip check afterwards.
+func TestPushStopsWhenGitHubBuildsADifferentTree(t *testing.T) {
 	f := newFixture(t)
 	c1 := f.commit(t, "feature", []plumbing.Hash{f.seed}, "add a",
 		map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("a\n")})
 
 	fake := newFake(t, f)
-	fake.corrupt = true
+	fake.corruptTree = true
 	res, err := Push(context.Background(), fake, f.options("feature"))
-
-	var sync *SyncError
-	if !errors.As(err, &sync) {
-		t.Fatalf("want SyncError, got %v", err)
+	if err == nil {
+		t.Fatal("want an error")
 	}
-	if len(sync.Replayed) != 1 || sync.Replayed[0].Local != c1.String() {
-		t.Fatalf("want the pair reported, got %+v", sync.Replayed)
+	if !strings.Contains(err.Error(), "not the local") {
+		t.Fatalf("want both tree OIDs named, got %v", err)
 	}
-	if len(res.Pairs) != 1 {
-		t.Fatalf("result pairs %+v", res.Pairs)
+	if len(res.Pairs) != 0 {
+		t.Fatalf("want no pairs, got %+v", res.Pairs)
+	}
+	if fake.countOf("create_commit") != 0 || fake.countOf("update_ref") != 0 || fake.countOf("create_ref") != 0 {
+		t.Fatal("a wrong tree must stop the push before any commit or ref call")
 	}
 	if branchHash(t, f.local, "feature") != c1 {
 		t.Fatal("local ref moved despite the tree mismatch")
@@ -1239,7 +1472,116 @@ func TestPushRefusesWhenLocalRefMovedDuringReplay(t *testing.T) {
 	}
 }
 
-func TestPushRefusesModeChangeFromExecutable(t *testing.T) {
+// remoteFiles renders the tree of a commit on the bare remote.
+func remoteFiles(t *testing.T, f *fixture, commitSHA string) map[string]fileSpec {
+	t.Helper()
+	c, err := f.remote.CommitObject(plumbing.NewHash(commitSHA))
+	if err != nil {
+		t.Fatalf("read remote commit %s: %v", commitSHA, err)
+	}
+	out := map[string]fileSpec{}
+	flattenTree(t, f.remote, c.TreeHash, "", out)
+	return out
+}
+
+// Every mode the Git Data tree API can carry must survive the round trip; the
+// post-replay tree check would catch a lost bit, but only after the push.
+func TestPushCarriesEveryModeIntoTheRemoteTree(t *testing.T) {
+	f := newFixture(t)
+	subHash := "1111111111111111111111111111111111111111"
+	main := f.commit(t, "main", []plumbing.Hash{f.seed}, "add script",
+		map[string]fileSpec{"README.md": regular("seed\n"), "run.sh": regular("#!/bin/sh\n")})
+	f.push(t, "main")
+	f.commit(t, "feature", []plumbing.Hash{main}, "chmod, script, link, submodule",
+		map[string]fileSpec{
+			"README.md":  regular("seed\n"),
+			"run.sh":     executable("#!/bin/sh\n"),
+			"new.sh":     executable("#!/bin/sh\nnew\n"),
+			"link":       symlink("run.sh"),
+			"vendor/dep": submodule(subHash),
+		})
+
+	fake := newFake(t, f)
+	res, err := Push(context.Background(), fake, f.options("feature"))
+	if err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	files := remoteFiles(t, f, res.Head)
+	for path, want := range map[string]filemode.FileMode{
+		"run.sh":     filemode.Executable,
+		"new.sh":     filemode.Executable,
+		"link":       filemode.Symlink,
+		"vendor/dep": filemode.Submodule,
+	} {
+		if got := files[path].mode; got != want {
+			t.Errorf("remote %s mode = %v, want %v", path, got, want)
+		}
+	}
+	if got := string(files["link"].content); got != "run.sh" {
+		t.Errorf("symlink target = %q, want run.sh", got)
+	}
+	if got := files["vendor/dep"].hash.String(); got != subHash {
+		t.Errorf("submodule OID = %s, want %s", got, subHash)
+	}
+	// A gitlink names a commit that is not in this repository, so it must not
+	// be offered to the blob endpoint; the other three changed paths are.
+	if fake.blobs != 3 {
+		t.Errorf("uploaded %d blobs, want one each for run.sh, new.sh and link", fake.blobs)
+	}
+}
+
+// Blob OIDs are content addressed, so identical content across commits is one
+// upload however many commits and paths name it.
+func TestPushUploadsEachBlobOnce(t *testing.T) {
+	f := newFixture(t)
+	c1 := f.commit(t, "feature", []plumbing.Hash{f.seed}, "add a",
+		map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("shared\n")})
+	f.commit(t, "feature", []plumbing.Hash{c1}, "add b with the same content",
+		map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("shared\n"),
+			"b.txt": regular("shared\n")})
+
+	fake := newFake(t, f)
+	if _, err := Push(context.Background(), fake, f.options("feature")); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if fake.countOf("create_commit") != 2 {
+		t.Fatalf("want two commits, got %d", fake.countOf("create_commit"))
+	}
+	if fake.blobs != 1 {
+		t.Fatalf("uploaded %d blobs, want 1 for the one distinct content", fake.blobs)
+	}
+}
+
+// A blob OID that comes back different means GitHub is holding different bytes
+// than the commit names, so the push stops before any commit is built.
+func TestPushStopsWhenGitHubStoresDifferentBlobBytes(t *testing.T) {
+	f := newFixture(t)
+	c1 := f.commit(t, "feature", []plumbing.Hash{f.seed}, "add a",
+		map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("a\n")})
+
+	fake := newFake(t, f)
+	fake.corrupt = true
+	res, err := Push(context.Background(), fake, f.options("feature"))
+
+	var refused *RefusedError
+	if !errors.As(err, &refused) {
+		t.Fatalf("want RefusedError, got %v", err)
+	}
+	if refused.Path != "a.txt" || !strings.Contains(refused.Reason, "not the local") {
+		t.Fatalf("want the path and both OIDs named, got %q", refused.Error())
+	}
+	if len(res.Pairs) != 0 {
+		t.Fatalf("want no pairs, got %+v", res.Pairs)
+	}
+	if fake.countOf("create_commit") != 0 || fake.countOf("update_ref") != 0 {
+		t.Fatal("a mismatched blob must stop the push before any commit or ref move")
+	}
+	if branchHash(t, f.local, "feature") != c1 {
+		t.Fatal("local ref moved")
+	}
+}
+
+func TestPushCarriesModeChangeToNonExecutable(t *testing.T) {
 	f := newFixture(t)
 	main := f.commit(t, "main", []plumbing.Hash{f.seed}, "add script",
 		map[string]fileSpec{"README.md": regular("seed\n"), "run.sh": executable("#!/bin/sh\n")})
@@ -1248,16 +1590,12 @@ func TestPushRefusesModeChangeFromExecutable(t *testing.T) {
 		map[string]fileSpec{"README.md": regular("seed\n"), "run.sh": regular("#!/bin/sh\nedited\n")})
 
 	fake := newFake(t, f)
-	_, err := Push(context.Background(), fake, f.options("feature"))
-	var refused *RefusedError
-	if !errors.As(err, &refused) {
-		t.Fatalf("want RefusedError, got %v", err)
+	res, err := Push(context.Background(), fake, f.options("feature"))
+	if err != nil {
+		t.Fatalf("Push: %v", err)
 	}
-	if !strings.Contains(refused.Reason, "mode change") || refused.Path != "run.sh" {
-		t.Fatalf("want the mode change named for run.sh, got %q", refused.Error())
-	}
-	if fake.mutations() != 0 {
-		t.Fatalf("want zero mutations, got %d", fake.mutations())
+	if got := remoteFiles(t, f, res.Head)["run.sh"].mode; got != filemode.Regular {
+		t.Fatalf("remote run.sh mode = %v, want the local 100644", got)
 	}
 }
 
@@ -1390,7 +1728,7 @@ func TestPushRefusesWhenFetchedHeadIsNotTheReplayedHead(t *testing.T) {
 	tree := map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("a\n")}
 
 	fake := newFake(t, f)
-	fake.afterCreate = func() {
+	fake.afterUpdate = func() {
 		f.remoteCommit(t, "feature", []plumbing.Hash{f.seed}, "rewritten", tree)
 	}
 
@@ -1433,14 +1771,37 @@ func TestPushWorksWhenBaseBranchIsGone(t *testing.T) {
 	}
 }
 
-func TestPushResumesWhenTheMessageHasNoBlankLine(t *testing.T) {
+// The Git Data commit endpoint stores the message verbatim, so a resume must
+// compare it verbatim: a remote commit whose body was reflowed is a different
+// commit, not a replay of this one, even when the trees agree.
+func TestPushDoesNotAdoptACommitWhoseMessageWasReflowed(t *testing.T) {
 	f := newFixture(t)
 	tree1 := map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("a\n")}
 	tree2 := map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("a\n"), "b.txt": regular("b\n")}
 	c1 := f.commit(t, "feature", []plumbing.Hash{f.seed}, "add a\nbody without a blank line", tree1)
 	f.commit(t, "feature", []plumbing.Hash{c1}, "add b", tree2)
-	// createCommitOnBranch takes a headline and a body and rejoins them
-	r1 := f.remoteCommit(t, "feature", []plumbing.Hash{f.seed}, "add a\n\nbody without a blank line", tree1)
+	f.remoteCommit(t, "feature", []plumbing.Hash{f.seed}, "add a\n\nbody without a blank line", tree1)
+
+	fake := newFake(t, f)
+	_, err := Push(context.Background(), fake, f.options("feature"))
+	var refused *RefusedError
+	if !errors.As(err, &refused) || !strings.Contains(refused.Reason, "behind") {
+		t.Fatalf("want a behind refusal, got %v", err)
+	}
+	if fake.mutations() != 0 {
+		t.Fatalf("want zero mutations, got %d", fake.mutations())
+	}
+}
+
+// A replay this tool made carries the message it was given, trailing newline
+// and all, so a re-run adopts it.
+func TestPushResumesOnAVerbatimMessage(t *testing.T) {
+	f := newFixture(t)
+	tree1 := map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("a\n")}
+	tree2 := map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("a\n"), "b.txt": regular("b\n")}
+	c1 := f.commit(t, "feature", []plumbing.Hash{f.seed}, "add a\nbody without a blank line", tree1)
+	f.commit(t, "feature", []plumbing.Hash{c1}, "add b", tree2)
+	r1 := f.remoteCommit(t, "feature", []plumbing.Hash{f.seed}, "add a\nbody without a blank line", tree1)
 
 	fake := newFake(t, f)
 	res, err := Push(context.Background(), fake, f.options("feature"))

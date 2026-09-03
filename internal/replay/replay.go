@@ -1,6 +1,6 @@
-// Package replay replays local commits onto GitHub through createCommitOnBranch
+// Package replay replays local commits onto GitHub through the Git Data API
 // and then moves the local branch ref onto the returned OIDs. See docs/design.md
-// and docs/decisions/0001-0004.
+// and docs/decisions/0001, 0003 and 0006.
 package replay
 
 import (
@@ -18,8 +18,8 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport"
 )
 
-// RefusedError reports a commit or remote that createCommitOnBranch cannot
-// represent. Nothing has been mutated when it is returned.
+// RefusedError reports a commit or remote the replay will not send. Nothing
+// has reached the remote branch when it is returned.
 type RefusedError struct {
 	OID    string
 	Path   string
@@ -64,9 +64,10 @@ func (e *SyncError) Error() string {
 	return "sync error: " + e.Reason + "; already replayed: [" + strings.Join(parts, ", ") + "]"
 }
 
-// Result is the outcome of a Push. Pairs is populated even when Push returns an
-// error, so a caller can record the commits that reached GitHub; Head is set
-// only when the replay completed and the local ref was moved.
+// Result is the outcome of a Push. Pairs is populated once the commits are on
+// the remote branch, so it is non-empty with an error only when the local ref
+// sync that follows failed; Head is set only when the replay completed and the
+// local ref was moved.
 type Result struct {
 	Pairs []Pair
 	Head  string
@@ -227,9 +228,10 @@ func (o Options) normalise() Options {
 	return o
 }
 
-// Push replays the commits the remote branch lacks onto GitHub, one
-// createCommitOnBranch per commit, then moves refs/heads/<branch> onto the
-// remote OIDs. On any refusal nothing is mutated.
+// Push replays the commits the remote branch lacks onto GitHub over the Git
+// Data API, then moves refs/heads/<branch> onto the remote OIDs. Nothing
+// reaches the remote branch until the single ref update at the end, so every
+// failure before it leaves the branch where it was.
 func Push(ctx context.Context, c Client, o Options) (Result, error) {
 	o = o.normalise()
 	for _, v := range []struct{ name, label string }{
@@ -253,7 +255,7 @@ func Push(ctx context.Context, c Client, o Options) (Result, error) {
 		return Result{}, err
 	}
 
-	remoteHasBranch, err := fetchRefs(ctx, repo, o, remoteURL)
+	remoteHasBranch, remoteHasBase, err := fetchRefs(ctx, repo, o, remoteURL)
 	if err != nil {
 		return Result{}, err
 	}
@@ -263,32 +265,35 @@ func Push(ctx context.Context, c Client, o Options) (Result, error) {
 		return Result{}, fmt.Errorf("resolve refs/heads/%s: %w", o.Branch, err)
 	}
 
-	var trackedName plumbing.ReferenceName
-	if remoteHasBranch {
-		trackedName = plumbing.NewRemoteReferenceName(o.Remote, o.Branch)
-	} else {
-		trackedName = plumbing.NewRemoteReferenceName(o.Remote, o.Base)
-	}
-	tracked, err := repo.Reference(trackedName, true)
-	if err != nil {
-		return Result{}, fmt.Errorf("resolve %s: %w", trackedName, err)
-	}
-
-	local, remoteOnly, err := diverged(repo, tracked.Hash(), localTip.Hash())
-	if err != nil {
-		return Result{}, err
-	}
-	if !remoteHasBranch {
-		// remoteOnly here is base-only history, which is not a replay concern.
-		remoteOnly = nil
-	}
-
-	for _, cm := range local {
-		if len(cm.ParentHashes) == 0 {
-			return Result{}, &RefusedError{OID: cm.Hash.String(), Reason: "commit has zero parents"}
+	var local, remoteOnly []*object.Commit
+	var tracked *plumbing.Reference
+	if remoteHasBranch || remoteHasBase {
+		name := plumbing.NewRemoteReferenceName(o.Remote, o.Base)
+		if remoteHasBranch {
+			name = plumbing.NewRemoteReferenceName(o.Remote, o.Branch)
 		}
-		if len(cm.ParentHashes) > 1 {
-			return Result{}, &RefusedError{OID: cm.Hash.String(), Reason: "commit is a merge commit"}
+		tracked, err = repo.Reference(name, true)
+		if err != nil {
+			return Result{}, fmt.Errorf("resolve %s: %w", name, err)
+		}
+		local, remoteOnly, err = diverged(repo, tracked.Hash(), localTip.Hash())
+		if err != nil {
+			return Result{}, err
+		}
+		if !remoteHasBranch {
+			// remoteOnly here is base-only history, which is not a replay concern.
+			remoteOnly = nil
+		}
+	} else {
+		// The remote holds neither the branch nor the base, so nothing of this
+		// history is there: replay the branch from its root.
+		tip, err := repo.CommitObject(localTip.Hash())
+		if err != nil {
+			return Result{}, fmt.Errorf("read %s: %w", localTip.Hash(), err)
+		}
+		local, err = walkUntil(repo, tip, nil)
+		if err != nil {
+			return Result{}, err
 		}
 	}
 
@@ -320,51 +325,101 @@ func Push(ctx context.Context, c Client, o Options) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("branch head: %w", err)
 	}
-	if head == "" {
-		if remoteHasBranch {
-			return Result{}, &SyncError{Reason: fmt.Sprintf(
-				"%s/%s exists locally as %s but not on GitHub", o.Remote, o.Branch, tracked.Hash())}
-		}
-		forkPoint, err := mergeBase(repo, tracked.Hash(), localTip.Hash())
-		if err != nil {
-			return Result{}, err
-		}
-		head, err = c.CreateBranch(ctx, owner, repoName, o.Branch, forkPoint.String())
-		if err != nil {
-			return Result{}, fmt.Errorf("create branch %s: %w", o.Branch, err)
-		}
-	} else if remoteHasBranch && head != tracked.Hash().String() {
+	switch {
+	case head == "" && remoteHasBranch:
 		return Result{}, &SyncError{Reason: fmt.Sprintf(
-			"%s/%s is at %s, not the fetched %s; nothing was sent, re-run to recompute the range",
-			o.Remote, o.Branch, head, tracked.Hash())}
-	} else if !remoteHasBranch {
+			"%s/%s exists locally as %s but not on GitHub", o.Remote, o.Branch, tracked.Hash())}
+	case head == "":
+		// The branch is new to the remote; it is created at the replayed tip.
+	case !remoteHasBranch:
 		return Result{}, &SyncError{Reason: fmt.Sprintf(
 			"%s/%s appeared on GitHub at %s after the fetch; nothing was sent, re-run to recompute the range",
 			o.Remote, o.Branch, head)}
+	case head != tracked.Hash().String():
+		return Result{}, &SyncError{Reason: fmt.Sprintf(
+			"%s/%s is at %s, not the fetched %s; nothing was sent, re-run to recompute the range",
+			o.Remote, o.Branch, head, tracked.Hash())}
 	}
 
 	pairs := make([]Pair, 0, len(adopted)+len(changes))
 	pairs = append(pairs, adopted...)
+	remoteHead := head
 
-	for _, ch := range changes {
-		newOID, err := c.CreateCommit(ctx, owner, repoName, o.Branch, head,
-			ch.message, ch.additions, ch.deletions)
-		if err != nil {
-			var mismatch *HeadMismatchError
-			if errors.As(err, &mismatch) {
-				return Result{Pairs: pairs}, &SyncError{
-					Reason: fmt.Sprintf("remote %s/%s head moved during replay of %s: %s",
-						o.Remote, o.Branch, ch.oid, mismatch.Message),
-					Replayed: pairs,
+	if len(changes) > 0 {
+		// remote maps a local commit OID to the OID it was replayed as, so a
+		// merge parent inside the range resolves to the commit just built.
+		remote := make(map[plumbing.Hash]string, len(adopted)+len(changes))
+		for i, p := range adopted {
+			remote[plumbing.NewHash(p.Local)] = adopted[i].Remote
+		}
+		// treeOf saves a round trip for a parent this run created.
+		treeOf := make(map[string]string, len(changes))
+
+		if err := uploadBlobs(ctx, c, repo, owner, repoName, changes); err != nil {
+			return Result{}, err
+		}
+
+		created := make([]Pair, 0, len(changes))
+		var last string
+		for _, ch := range changes {
+			parents, err := remoteParents(ctx, c, owner, repoName, ch, remote)
+			if err != nil {
+				return Result{}, err
+			}
+			baseTree := ""
+			if len(parents) > 0 {
+				baseTree = treeOf[parents[0]]
+				if baseTree == "" {
+					if baseTree, err = c.CommitTree(ctx, owner, repoName, parents[0]); err != nil {
+						return Result{}, fmt.Errorf("tree of %s: %w", parents[0], err)
+					}
+					treeOf[parents[0]] = baseTree
 				}
 			}
-			return Result{Pairs: pairs}, fmt.Errorf("create commit %s: %w", ch.oid, err)
+			tree, err := c.CreateTree(ctx, owner, repoName, baseTree, treeEntries(ch))
+			if err != nil {
+				return Result{}, fmt.Errorf("create tree for %s: %w", ch.oid, err)
+			}
+			// base_tree is the local first parent's tree and the entries carry
+			// local blob OIDs, so the result must be the tree the local commit
+			// names. Checking here catches a divergence before the ref moves;
+			// the tip check in syncLocalRef would only catch it afterwards.
+			if tree != ch.tree.String() {
+				return Result{}, fmt.Errorf(
+					"tree GitHub built for %s is %s, not the local %s; nothing was published",
+					ch.oid, tree, ch.tree)
+			}
+			newOID, err := c.CreateCommit(ctx, owner, repoName, ch.message, tree, parents)
+			if err != nil {
+				return Result{}, fmt.Errorf("create commit %s: %w", ch.oid, err)
+			}
+			created = append(created, Pair{Local: ch.oid, Remote: newOID})
+			remote[plumbing.NewHash(ch.oid)] = newOID
+			treeOf[newOID] = tree
+			last = newOID
 		}
-		pairs = append(pairs, Pair{Local: ch.oid, Remote: newOID})
-		head = newOID
+
+		// One ref call publishes the whole range. Creating a new branch at the
+		// tip rather than at a fork point keeps that true: a failure here
+		// leaves no branch behind for a caller to open a PR from.
+		publish := c.UpdateRef
+		if head == "" {
+			publish = c.CreateRef
+		}
+		if err := publish(ctx, owner, repoName, o.Branch, last); err != nil {
+			var mismatch *HeadMismatchError
+			if errors.As(err, &mismatch) {
+				return Result{}, &SyncError{Reason: fmt.Sprintf(
+					"remote %s/%s moved before the ref update (%s); nothing landed on the branch. The commits built for this push (%s) are unreachable and GitHub will collect them; re-run to replay onto the new head",
+					o.Remote, o.Branch, mismatch.Message, joinRemotes(created))}
+			}
+			return Result{}, fmt.Errorf("point %s at %s: %w", o.Branch, last, err)
+		}
+		pairs = append(pairs, created...)
+		remoteHead = last
 	}
 
-	finalHead, err := syncLocalRef(ctx, repo, o, remoteURL, localTip.Hash(), pairs[len(pairs)-1].Remote)
+	finalHead, err := syncLocalRef(ctx, repo, o, remoteURL, localTip.Hash(), remoteHead)
 	if err != nil {
 		var sync *SyncError
 		if errors.As(err, &sync) {
@@ -385,12 +440,17 @@ func pinnedRemote(repo *git.Repository, name, url string) *git.Remote {
 }
 
 // fetchRefs brings the base and, when it exists on the remote, the branch into
-// refs/remotes/<remote>/. It reports whether the remote has the branch.
-func fetchRefs(ctx context.Context, repo *git.Repository, o Options, remoteURL string) (bool, error) {
+// refs/remotes/<remote>/. It reports whether the remote has the branch and
+// whether it has the base.
+func fetchRefs(ctx context.Context, repo *git.Repository, o Options, remoteURL string) (bool, bool, error) {
 	rem := pinnedRemote(repo, o.Remote, remoteURL)
 	refs, err := rem.ListContext(ctx, &git.ListOptions{Auth: o.Auth})
+	if errors.Is(err, transport.ErrEmptyRemoteRepository) {
+		// A repository with no refs at all: the whole branch is the range.
+		return false, false, nil
+	}
 	if err != nil {
-		return false, fmt.Errorf("list %s: %w", o.Remote, err)
+		return false, false, fmt.Errorf("list %s: %w", o.Remote, err)
 	}
 	branchRef := plumbing.NewBranchReferenceName(o.Branch)
 	baseRef := plumbing.NewBranchReferenceName(o.Base)
@@ -403,25 +463,26 @@ func fetchRefs(ctx context.Context, repo *git.Repository, o Options, remoteURL s
 			hasBase = true
 		}
 	}
-	var specs []config.RefSpec
-	if hasBranch {
-		specs = append(specs, config.RefSpec(fmt.Sprintf(
-			"+refs/heads/%s:refs/remotes/%s/%s", o.Branch, o.Remote, o.Branch)))
-	} else {
-		// The base is only needed to place a branch the remote does not have.
-		if !hasBase {
-			return false, &RefusedError{Reason: fmt.Sprintf("%s has no branch %s", o.Remote, o.Base)}
-		}
-		specs = append(specs, config.RefSpec(fmt.Sprintf(
-			"+refs/heads/%s:refs/remotes/%s/%s", o.Base, o.Remote, o.Base)))
+	// With neither ref present there is nothing to fetch: the remote has no
+	// history for this branch, so the range is the branch's whole history.
+	var spec config.RefSpec
+	switch {
+	case hasBranch:
+		spec = config.RefSpec(fmt.Sprintf(
+			"+refs/heads/%s:refs/remotes/%s/%s", o.Branch, o.Remote, o.Branch))
+	case hasBase:
+		spec = config.RefSpec(fmt.Sprintf(
+			"+refs/heads/%s:refs/remotes/%s/%s", o.Base, o.Remote, o.Base))
+	default:
+		return false, false, nil
 	}
 	err = rem.FetchContext(ctx, &git.FetchOptions{
-		RefSpecs: specs, Auth: o.Auth, Tags: git.NoTags, Force: true,
+		RefSpecs: []config.RefSpec{spec}, Auth: o.Auth, Tags: git.NoTags, Force: true,
 	})
 	if err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
-		return false, fmt.Errorf("fetch %s: %w", o.Remote, err)
+		return false, false, fmt.Errorf("fetch %s: %w", o.Remote, err)
 	}
-	return hasBranch, nil
+	return hasBranch, hasBase, nil
 }
 
 // syncLocalRef re-fetches the branch, requires the fetched head to carry the
@@ -491,20 +552,29 @@ func matchReplayed(local, remoteOnly []*object.Commit) ([]Pair, []*object.Commit
 		return nil, nil, behind
 	}
 	pairs := make([]Pair, 0, len(remoteOnly))
+	adoptedAs := make(map[plumbing.Hash]plumbing.Hash, len(remoteOnly))
 	for i, rc := range remoteOnly {
 		lc := local[i]
-		if rc.TreeHash != lc.TreeHash || storedMessage(rc.Message) != storedMessage(lc.Message) {
+		if rc.TreeHash != lc.TreeHash || normaliseMessage(rc.Message) != normaliseMessage(lc.Message) {
 			return nil, nil, behind
 		}
-		// The adopted commits must form the chain a replay would have built,
-		// starting where the first local commit does.
-		want := lc.ParentHashes[0]
-		if i > 0 {
-			want = remoteOnly[i-1].Hash
-		}
-		if len(rc.ParentHashes) != 1 || rc.ParentHashes[0] != want {
+		// Each adopted commit must sit where a replay would have put it: every
+		// parent already adopted resolves to its remote OID, and every parent
+		// from before the range keeps the OID it has locally. For a linear
+		// range this is the chain; for a merge it also pins the second parent.
+		if len(rc.ParentHashes) != len(lc.ParentHashes) {
 			return nil, nil, behind
 		}
+		for j, lp := range lc.ParentHashes {
+			want := lp
+			if mapped, ok := adoptedAs[lp]; ok {
+				want = mapped
+			}
+			if rc.ParentHashes[j] != want {
+				return nil, nil, behind
+			}
+		}
+		adoptedAs[lc.Hash] = rc.Hash
 		pairs = append(pairs, Pair{Local: lc.Hash.String(), Remote: rc.Hash.String()})
 	}
 	return pairs, local[len(remoteOnly):], nil
@@ -514,15 +584,45 @@ func normaliseMessage(m string) string {
 	return strings.TrimRight(m, "\n")
 }
 
-// storedMessage renders a commit message the way createCommitOnBranch stores
-// it: a headline and a body joined by a blank line. Comparing raw messages
-// would refuse to resume a replay of a message with no blank line after the
-// subject.
-func storedMessage(m string) string {
-	headline, body, _ := strings.Cut(normaliseMessage(m), "\n")
-	body = strings.TrimSpace(body)
-	if body == "" {
-		return headline
+// remoteParents maps every parent of a local commit to the OID it has on the
+// remote: a parent inside the range is one this run replayed, and a parent
+// outside it must already be on the remote, where its OID is unchanged.
+func remoteParents(ctx context.Context, c Client, owner, repo string, ch *commitChange,
+	remote map[plumbing.Hash]string) ([]string, error) {
+	out := make([]string, 0, len(ch.parents))
+	for _, ph := range ch.parents {
+		if oid, ok := remote[ph]; ok {
+			out = append(out, oid)
+			continue
+		}
+		if _, err := c.CommitTree(ctx, owner, repo, ph.String()); err != nil {
+			return nil, &RefusedError{OID: ch.oid, Reason: fmt.Sprintf(
+				"parent %s is neither in the range being pushed nor already on the remote", ph)}
+		}
+		out = append(out, ph.String())
 	}
-	return headline + "\n\n" + body
+	return out, nil
+}
+
+// treeEntries renders a commit's changed paths for the Git Data tree call; a
+// deletion carries no SHA.
+func treeEntries(ch *commitChange) []TreeEntry {
+	out := make([]TreeEntry, 0, len(ch.entries))
+	for _, e := range ch.entries {
+		te := TreeEntry{Path: e.path, Mode: e.mode}
+		if !e.hash.IsZero() {
+			sha := e.hash.String()
+			te.SHA = &sha
+		}
+		out = append(out, te)
+	}
+	return out
+}
+
+func joinRemotes(pairs []Pair) string {
+	out := make([]string, 0, len(pairs))
+	for _, p := range pairs {
+		out = append(out, p.Remote)
+	}
+	return strings.Join(out, ", ")
 }

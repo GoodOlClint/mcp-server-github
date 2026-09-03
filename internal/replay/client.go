@@ -26,4 +26,6 @@ type HeadMismatchError struct {
 	Message  string
 }
 
-func (e *HeadMismatchError) Error() string { return "remote head is not " + e.Expected + ": " + e.Message }
+func (e *HeadMismatchError) Error() string {
+	return "remote head is not " + e.Expected + ": " + e.Message
+}

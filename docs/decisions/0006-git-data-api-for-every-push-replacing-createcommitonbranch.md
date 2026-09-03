@@ -15,7 +15,7 @@ Every push uses the Git Data API and nothing else: one `POST /git/blobs` per uni
 
 ## Rejected alternatives
 
-- **Keep `createCommitOnBranch` and use Git Data only for commits it cannot represent.** Two code paths for one behaviour; the fallback would carry the whole feature anyway.
+- **Keep `createCommitOnBranch` and use Git Data only for commits it cannot represent.** Two code paths for one behaviour; the fallback would carry the whole feature anyway. Held in reserve, not rejected outright: if the G6 timing measurement is materially worse than the GraphQL baseline (4.8 s for two commits over three files), the GraphQL path comes back as primary and Git Data handles only what it would have refused (mode changes, new executables, symlinks, submodules). Operator ruling 2026-09-03.
 - **Keep refusing modes.** Every chmod and new script needed an operator push; the reason for refusing (no signed path) turned out to be false.
 - **Packfile upload.** No signed endpoint accepts one; a packfile carries finished commit objects.
 

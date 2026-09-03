@@ -150,7 +150,7 @@ func ownerRepoURL(repo *git.Repository, remote string) (string, string, string, 
 	if err != nil {
 		return "", "", "", err
 	}
-	return owner, name, urls[0], nil
+	return owner, name, "https://github.com/" + owner + "/" + name + ".git", nil
 }
 
 var repoSegmentRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
@@ -303,7 +303,8 @@ func Push(ctx context.Context, c Client, o Options) (Result, error) {
 		if remoteHasBranch {
 			return Result{Pairs: nil, Head: tracked.Hash().String()}, nil
 		}
-		return Result{Pairs: nil, Head: localTip.Hash().String()}, nil
+		return Result{}, &RefusedError{Reason: fmt.Sprintf(
+			"nothing to push: %s has no commits beyond %s/%s and does not exist on the remote", o.Branch, o.Remote, o.Base)}
 	}
 
 	changes := make([]*commitChange, 0, len(pending))
@@ -375,8 +376,10 @@ func Push(ctx context.Context, c Client, o Options) (Result, error) {
 	return Result{Pairs: pairs, Head: finalHead}, nil
 }
 
-// pinnedRemote builds a remote bound to the URL OwnerRepo validated rather than
-// re-reading .git/config, which go-git parses afresh on every access.
+// pinnedRemote builds a remote bound to the canonical https URL for the
+// validated owner/repo rather than re-reading .git/config, which go-git parses
+// afresh on every access. Transport is always https because Auth is an
+// installation token, whatever scheme the configured remote uses.
 func pinnedRemote(repo *git.Repository, name, url string) *git.Remote {
 	return git.NewRemote(repo.Storer, &config.RemoteConfig{Name: name, URLs: []string{url}})
 }

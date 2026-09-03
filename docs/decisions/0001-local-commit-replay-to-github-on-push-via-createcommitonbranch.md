@@ -23,5 +23,5 @@ Agents commit locally with ordinary git. The tool pushes by walking `origin/<bas
 
 - One network call per commit; the tool must be idempotent on retry by re-reading the remote head.
 - Remote OIDs differ from local OIDs (ADR 0003 handles the local side).
-- No custom author, committer, or timestamp on the replayed commits; the App is the author. The original local timestamp is not preserved.
+- No custom author, committer, or timestamp on the replayed commits; the App is the author. The original local timestamp is not preserved. The Verified badge therefore attests that the App made the commit, not who wrote the local commit; every commit in the range is re-authored, including ones a human made locally.
 - Empty commits and merge commits in the range are errors.

@@ -22,7 +22,7 @@ When a commit in the range contains a mode change, a non-regular-file entry, or 
 
 - Shell-script PRs and anything touching modes stay on local push until GitHub adds a mode field to the mutation.
 - The payload ceiling is measured against the target repo's largest file before the spike is called done, and the number is recorded here.
-- Deletions carry no content, so a deletion is representable whatever the deleted file's mode was. The refusal covers entries whose destination mode is neither `100644` nor absent, and modifications whose source mode is not `100644`; deleting an executable or a symlink is allowed.
+- Deletions carry no content, so a deletion is representable whatever the deleted file's mode was. The refusal covers entries whose destination mode is neither `100644` nor absent, and modifications whose source mode is not `100644`; deleting an executable or a symlink is allowed. Submodule entries (mode `160000`) are refused in every position, including deletion, because the mutation's effect on a gitlink is unmeasured.
 - Measured ceiling, P3 spike, 2026-09-03, pushing generated random-byte files to `GoodOlClint/PSProxmoxVE` from the operator's workstation (raw addition bytes; the request carries about 1.34x that after base64):
 
   | Payload | Attempts | Result |

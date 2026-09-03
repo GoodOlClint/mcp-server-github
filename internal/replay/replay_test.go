@@ -608,20 +608,15 @@ func TestOwnerRepoRefusesGitHubURLWithUserinfo(t *testing.T) {
 	}
 }
 
-func TestPushEmptyRangeWithoutRemoteBranchCreatesNothing(t *testing.T) {
+func TestPushEmptyRangeWithoutRemoteBranchIsRefused(t *testing.T) {
 	f := newFixture(t)
 	setBranch(t, f.local, "feature", f.seed)
 
 	fake := newFake(t, f)
-	res, err := Push(context.Background(), fake, f.options("feature"))
-	if err != nil {
-		t.Fatalf("Push: %v", err)
-	}
-	if len(res.Pairs) != 0 {
-		t.Fatalf("want zero pairs, got %+v", res.Pairs)
-	}
-	if res.Head != f.seed.String() {
-		t.Fatalf("head = %q, want the local tip %s", res.Head, f.seed)
+	_, err := Push(context.Background(), fake, f.options("feature"))
+	var refused *RefusedError
+	if !errors.As(err, &refused) || !strings.Contains(refused.Reason, "nothing to push") {
+		t.Fatalf("want nothing-to-push refusal, got %v", err)
 	}
 	for _, c := range fake.calls {
 		if c.kind == "create_branch" || c.kind == "create_commit" {
@@ -633,6 +628,28 @@ func TestPushEmptyRangeWithoutRemoteBranchCreatesNothing(t *testing.T) {
 	}
 	if _, err := f.remote.Reference(plumbing.NewBranchReferenceName("feature"), true); err == nil {
 		t.Fatal("remote branch was created")
+	}
+}
+
+func TestPushUsesHTTPSTransportForSCPFormOrigin(t *testing.T) {
+	f := newFixture(t)
+	if err := f.local.DeleteRemote("origin"); err != nil {
+		t.Fatalf("delete remote: %v", err)
+	}
+	if _, err := f.local.CreateRemote(&config.RemoteConfig{
+		Name: "origin", URLs: []string{"git@github.com:" + strings.TrimPrefix(f.epPath, "/")},
+	}); err != nil {
+		t.Fatalf("create remote: %v", err)
+	}
+	c1 := f.commit(t, "feature", []plumbing.Hash{f.seed}, "one", map[string]fileSpec{"a.txt": regular("a")})
+
+	fake := newFake(t, f)
+	res, err := Push(context.Background(), fake, f.options("feature"))
+	if err != nil {
+		t.Fatalf("Push over scp-form origin: %v", err)
+	}
+	if len(res.Pairs) != 1 || res.Pairs[0].Local != c1.String() {
+		t.Fatalf("pairs = %+v, want one pair for %s", res.Pairs, c1)
 	}
 }
 

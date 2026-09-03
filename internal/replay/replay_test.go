@@ -1563,12 +1563,12 @@ func TestPushStopsWhenGitHubStoresDifferentBlobBytes(t *testing.T) {
 	fake.corrupt = true
 	res, err := Push(context.Background(), fake, f.options("feature"))
 
-	var refused *RefusedError
-	if !errors.As(err, &refused) {
-		t.Fatalf("want RefusedError, got %v", err)
+	var sync *SyncError
+	if !errors.As(err, &sync) {
+		t.Fatalf("want SyncError, got %v", err)
 	}
-	if refused.Path != "a.txt" || !strings.Contains(refused.Reason, "not the local") {
-		t.Fatalf("want the path and both OIDs named, got %q", refused.Error())
+	if len(sync.Replayed) != 0 || !strings.Contains(sync.Reason, "a.txt") || !strings.Contains(sync.Reason, "nothing was published") {
+		t.Fatalf("want a zero-pair SyncError naming the path, got %q", sync.Error())
 	}
 	if len(res.Pairs) != 0 {
 		t.Fatalf("want no pairs, got %+v", res.Pairs)

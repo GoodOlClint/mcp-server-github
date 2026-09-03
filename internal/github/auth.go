@@ -1,5 +1,5 @@
-// Package github implements GitHub App authentication and a GraphQL client
-// satisfying the replay.Client interface.
+// Package github implements GitHub App authentication and a Git Data REST
+// client satisfying the replay.Client interface.
 package github
 
 import (

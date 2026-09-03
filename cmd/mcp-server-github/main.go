@@ -41,10 +41,10 @@ func main() {
 	var roots repoRoots
 	fs := flag.NewFlagSet("mcp-server-github", flag.ExitOnError)
 	fs.Var(&roots, "repo-root", "directory a repo_path may live inside; repeatable, required")
-	endpoint := fs.String("endpoint", "", "GitHub GraphQL endpoint (default https://api.github.com/graphql)")
-	timeout := fs.Duration("timeout", 120*time.Second, "per-request timeout for GitHub GraphQL calls")
+	endpoint := fs.String("endpoint", "", "GitHub REST API root (default https://api.github.com)")
+	timeout := fs.Duration("timeout", 120*time.Second, "per-request timeout for GitHub API calls")
 	maxCommitBytes := fs.Int64("max-commit-bytes", tool.DefaultMaxCommitBytes,
-		"per-commit payload ceiling; the measurement behind the default is in ADR 0002 and depends on the uplink")
+		"per-commit ceiling on uploaded bytes; the measurement behind the default is in ADR 0006 and depends on the uplink")
 	// flag.ExitOnError already exits on a parse failure.
 	_ = fs.Parse(os.Args[1:])
 	if len(roots) == 0 {

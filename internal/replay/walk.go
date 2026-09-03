@@ -14,32 +14,47 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
-// commitChange is one local commit rendered as a createCommitOnBranch payload.
-type commitChange struct {
-	oid       string
-	message   string
-	additions []FileAddition
-	deletions []string
+// maxBlobBytes is the largest blob the API actually accepts. GitHub documents
+// 100 MB, but the blobs endpoint rejects a request whose base64 content exceeds
+// 32 MiB with HTTP 401 "Bad credentials", which is 24 MiB of file. Measured
+// against api.github.com on 2026-09-03: 24 MiB uploads, 25 MB does not.
+const maxBlobBytes int64 = 24 << 20
+
+// submoduleMode is a gitlink: the OID names a commit in another repository, so
+// it is referenced in the tree and never uploaded.
+const submoduleMode = "160000"
+
+// entryChange is one changed path of a commit. hash is zero for a deletion and
+// a gitlink OID for a submodule; otherwise it names a blob to upload.
+type entryChange struct {
+	path string
+	mode string
+	hash plumbing.Hash
 }
 
-func mergeBase(repo *git.Repository, a, b plumbing.Hash) (plumbing.Hash, error) {
-	ca, err := repo.CommitObject(a)
-	if err != nil {
-		return plumbing.ZeroHash, fmt.Errorf("read %s: %w", a, err)
+// commitChange is one local commit rendered as a tree patch. tree is the OID
+// the remote tree must come back as.
+type commitChange struct {
+	oid     string
+	message string
+	tree    plumbing.Hash
+	parents []plumbing.Hash
+	entries []entryChange
+}
+
+// modeString renders a git file mode the way the Git Data API spells it.
+func modeString(m filemode.FileMode) (string, bool) {
+	switch m {
+	case filemode.Regular:
+		return "100644", true
+	case filemode.Executable:
+		return "100755", true
+	case filemode.Symlink:
+		return "120000", true
+	case filemode.Submodule:
+		return "160000", true
 	}
-	cb, err := repo.CommitObject(b)
-	if err != nil {
-		return plumbing.ZeroHash, fmt.Errorf("read %s: %w", b, err)
-	}
-	bases, err := ca.MergeBase(cb)
-	if err != nil {
-		return plumbing.ZeroHash, fmt.Errorf("merge base %s %s: %w", a, b, err)
-	}
-	if len(bases) == 0 {
-		return plumbing.ZeroHash, &RefusedError{Reason: fmt.Sprintf(
-			"%s and %s have no common ancestor", a, b)}
-	}
-	return bases[0].Hash, nil
+	return "", false
 }
 
 // diverged returns the commits reachable from b but not a, and from a but not
@@ -182,18 +197,22 @@ func topoOldestFirst(commits map[plumbing.Hash]*object.Commit) []*object.Commit 
 	return out
 }
 
-// changesFor renders one commit as additions and deletions, reading blobs from
-// the object store and never from the working tree. Every entry the mutation
-// cannot represent is a refusal (ADR 0002).
+// changesFor renders one commit as a tree patch, taking modes and blob OIDs
+// from the object store and never from the working tree. Blob contents are not
+// read here; Push uploads each unique blob once.
 func changesFor(ctx context.Context, repo *git.Repository, c *object.Commit, maxBytes int64) (*commitChange, error) {
 	oid := c.Hash.String()
-	parent, err := repo.CommitObject(c.ParentHashes[0])
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", c.ParentHashes[0], err)
-	}
-	parentTree, err := parent.Tree()
-	if err != nil {
-		return nil, fmt.Errorf("tree of %s: %w", parent.Hash, err)
+	// A root commit has no parent tree; go-git diffs a nil tree as empty.
+	var parentTree *object.Tree
+	if len(c.ParentHashes) > 0 {
+		parent, err := repo.CommitObject(c.ParentHashes[0])
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", c.ParentHashes[0], err)
+		}
+		parentTree, err = parent.Tree()
+		if err != nil {
+			return nil, fmt.Errorf("tree of %s: %w", parent.Hash, err)
+		}
 	}
 	tree, err := c.Tree()
 	if err != nil {
@@ -207,10 +226,12 @@ func changesFor(ctx context.Context, repo *git.Repository, c *object.Commit, max
 		if perr := validateTreePaths(repo, oid, tree.Hash, "", seen); perr != nil {
 			return nil, perr
 		}
-		if perr := validateTreePaths(repo, oid, parentTree.Hash, "", seen); perr != nil {
-			return nil, perr
+		if parentTree != nil {
+			if perr := validateTreePaths(repo, oid, parentTree.Hash, "", seen); perr != nil {
+				return nil, perr
+			}
 		}
-		return nil, fmt.Errorf("diff %s..%s: %w", parent.Hash, c.Hash, err)
+		return nil, fmt.Errorf("diff into %s: %w", c.Hash, err)
 	}
 	if len(changes) == 0 {
 		return nil, &RefusedError{OID: oid, Reason: "commit is empty"}
@@ -220,8 +241,13 @@ func changesFor(ctx context.Context, repo *git.Repository, c *object.Commit, max
 	if !utf8.ValidString(message) {
 		return nil, &RefusedError{OID: oid, Reason: "commit message is not valid UTF-8"}
 	}
+	// message is required by the commit endpoint, so an empty one is a
+	// pre-flight refusal rather than a failure after the blobs are uploaded.
+	if message == "" {
+		return nil, &RefusedError{OID: oid, Reason: "commit message is empty"}
+	}
 	total := int64(len(message))
-	out := &commitChange{oid: oid, message: message}
+	out := &commitChange{oid: oid, message: message, tree: c.TreeHash, parents: c.ParentHashes}
 
 	sort.Sort(changes)
 	for _, ch := range changes {
@@ -232,41 +258,37 @@ func changesFor(ctx context.Context, repo *git.Repository, c *object.Commit, max
 		if err := checkPath(oid, path); err != nil {
 			return nil, err
 		}
-		srcMode, dstMode := ch.From.TreeEntry.Mode, ch.To.TreeEntry.Mode
-		if srcMode == filemode.Submodule || dstMode == filemode.Submodule {
-			return nil, &RefusedError{OID: oid, Path: path, Reason: "entry is a submodule"}
-		}
-		if dstMode == filemode.Empty {
-			out.deletions = append(out.deletions, path)
+		dst := ch.To.TreeEntry
+		if dst.Mode == filemode.Empty {
+			mode, ok := modeString(ch.From.TreeEntry.Mode)
+			if !ok {
+				return nil, &RefusedError{OID: oid, Path: path, Reason: fmt.Sprintf(
+					"mode %s is not a file, symlink or submodule", ch.From.TreeEntry.Mode)}
+			}
+			out.entries = append(out.entries, entryChange{path: path, mode: mode})
 			continue
 		}
-		if dstMode != filemode.Regular && dstMode != filemode.Executable {
+		mode, ok := modeString(dst.Mode)
+		if !ok {
 			return nil, &RefusedError{OID: oid, Path: path, Reason: fmt.Sprintf(
-				"resulting mode %s is not a regular file", dstMode)}
+				"mode %s is not a file, symlink or submodule", dst.Mode)}
 		}
-		// createCommitOnBranch carries no mode: a new entry lands as 100644 and
-		// a modified entry keeps the mode it already has on the remote.
-		if srcMode == filemode.Empty && dstMode == filemode.Executable {
-			return nil, &RefusedError{OID: oid, Path: path, Reason: "new file would lose its executable bit"}
+		if dst.Mode != filemode.Submodule {
+			size, err := blobSize(repo, dst.Hash)
+			if err != nil {
+				return nil, err
+			}
+			if size > maxBlobBytes {
+				return nil, &RefusedError{OID: oid, Path: path, Reason: fmt.Sprintf(
+					"blob is %d bytes, over the %d byte per-blob upload limit", size, maxBlobBytes)}
+			}
+			total += size
+			if total > maxBytes {
+				return nil, &RefusedError{OID: oid, Path: path, Reason: fmt.Sprintf(
+					"commit exceeds MaxCommitBytes (%d)", maxBytes)}
+			}
 		}
-		if srcMode != filemode.Empty && srcMode != dstMode {
-			return nil, &RefusedError{OID: oid, Path: path, Reason: fmt.Sprintf(
-				"mode change %s to %s cannot be represented", srcMode, dstMode)}
-		}
-		size, err := blobSize(repo, ch.To.TreeEntry.Hash)
-		if err != nil {
-			return nil, err
-		}
-		total += size
-		if total > maxBytes {
-			return nil, &RefusedError{OID: oid, Path: path, Reason: fmt.Sprintf(
-				"commit exceeds MaxCommitBytes (%d)", maxBytes)}
-		}
-		content, err := readBlob(repo, ch.To.TreeEntry.Hash)
-		if err != nil {
-			return nil, err
-		}
-		out.additions = append(out.additions, FileAddition{Path: path, Contents: content})
+		out.entries = append(out.entries, entryChange{path: path, mode: mode, hash: dst.Hash})
 	}
 	return out, nil
 }
@@ -343,9 +365,44 @@ func readBlob(repo *git.Repository, h plumbing.Hash) ([]byte, error) {
 		return nil, fmt.Errorf("read blob %s: %w", h, err)
 	}
 	defer r.Close()
-	content, err := io.ReadAll(r)
+	content, err := io.ReadAll(io.LimitReader(r, maxBlobBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read blob %s: %w", h, err)
 	}
+	// The size check in changesFor reads the object header; a stream longer
+	// than the header declared would otherwise be uploaded unchecked.
+	if int64(len(content)) > maxBlobBytes {
+		return nil, &RefusedError{Reason: fmt.Sprintf(
+			"blob %s is longer than the %d byte per-blob upload limit", h, maxBlobBytes)}
+	}
 	return content, nil
+}
+
+// uploadBlobs sends every blob the range needs exactly once. Blob OIDs are
+// content addressed, so a returned OID that differs from the local one means
+// the bytes GitHub stored are not the bytes the commit names.
+func uploadBlobs(ctx context.Context, c Client, repo *git.Repository, owner, repoName string,
+	changes []*commitChange) error {
+	seen := make(map[plumbing.Hash]bool)
+	for _, ch := range changes {
+		for _, e := range ch.entries {
+			if e.hash.IsZero() || e.mode == submoduleMode || seen[e.hash] {
+				continue
+			}
+			seen[e.hash] = true
+			content, err := readBlob(repo, e.hash)
+			if err != nil {
+				return err
+			}
+			got, err := c.CreateBlob(ctx, owner, repoName, content)
+			if err != nil {
+				return fmt.Errorf("upload blob %s for %s in %s: %w", e.hash, e.path, ch.oid, err)
+			}
+			if got != e.hash.String() {
+				return &RefusedError{OID: ch.oid, Path: e.path, Reason: fmt.Sprintf(
+					"GitHub stored the blob as %s, not the local %s", got, e.hash)}
+			}
+		}
+	}
+	return nil
 }

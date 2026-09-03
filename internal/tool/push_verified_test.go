@@ -24,11 +24,23 @@ func (fakeClient) BranchHead(context.Context, string, string, string) (string, e
 	return "", nil
 }
 
-func (fakeClient) CreateBranch(context.Context, string, string, string, string) (string, error) {
+func (fakeClient) CreateRef(context.Context, string, string, string, string) error { return nil }
+
+func (fakeClient) UpdateRef(context.Context, string, string, string, string) error { return nil }
+
+func (fakeClient) CommitTree(context.Context, string, string, string) (string, error) {
 	return "", nil
 }
 
-func (fakeClient) CreateCommit(context.Context, string, string, string, string, string, []replay.FileAddition, []string) (string, error) {
+func (fakeClient) CreateBlob(context.Context, string, string, []byte) (string, error) {
+	return "", nil
+}
+
+func (fakeClient) CreateTree(context.Context, string, string, string, []replay.TreeEntry) (string, error) {
+	return "", nil
+}
+
+func (fakeClient) CreateCommit(context.Context, string, string, string, string, []string) (string, error) {
 	return "", nil
 }
 

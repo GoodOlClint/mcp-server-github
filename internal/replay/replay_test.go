@@ -454,7 +454,11 @@ func (f *fakeClient) CreateCommit(_ context.Context, _, _, branch, expectedHeadO
 		if f.corrupt {
 			content = append(append([]byte{}, content...), []byte("corrupt\n")...)
 		}
-		files[a.Path] = regularBytes(content)
+		spec := regularBytes(content)
+		if prev, ok := files[a.Path]; ok {
+			spec.mode = prev.mode
+		}
+		files[a.Path] = spec
 	}
 	tree := writeTree(f.t, f.remote.Storer, files)
 	h := writeCommitObject(f.t, f.remote.Storer, botSig, []plumbing.Hash{head}, message, tree)
@@ -875,7 +879,7 @@ func TestPushRefusals(t *testing.T) {
 				f.commit(t, "feature", []plumbing.Hash{f.seed}, "add script",
 					with(map[string]fileSpec{"run.sh": executable("#!/bin/sh\n")}))
 			},
-			reason: "not a regular file",
+			reason: "executable bit",
 		},
 		{
 			name: "mode change to executable",
@@ -885,7 +889,7 @@ func TestPushRefusals(t *testing.T) {
 				f.commit(t, "feature", []plumbing.Hash{c1}, "chmod",
 					with(map[string]fileSpec{"run.sh": executable("#!/bin/sh\n")}))
 			},
-			reason: "not a regular file",
+			reason: "mode change",
 		},
 		{
 			name: "symlink",
@@ -1249,11 +1253,38 @@ func TestPushRefusesModeChangeFromExecutable(t *testing.T) {
 	if !errors.As(err, &refused) {
 		t.Fatalf("want RefusedError, got %v", err)
 	}
-	if !strings.Contains(refused.Reason, "source mode") || refused.Path != "run.sh" {
-		t.Fatalf("want the source mode named for run.sh, got %q", refused.Error())
+	if !strings.Contains(refused.Reason, "mode change") || refused.Path != "run.sh" {
+		t.Fatalf("want the mode change named for run.sh, got %q", refused.Error())
 	}
 	if fake.mutations() != 0 {
 		t.Fatalf("want zero mutations, got %d", fake.mutations())
+	}
+}
+
+func TestPushKeepsModeWhenEditingExecutable(t *testing.T) {
+	f := newFixture(t)
+	main := f.commit(t, "main", []plumbing.Hash{f.seed}, "add script",
+		map[string]fileSpec{"README.md": regular("seed\n"), "run.sh": executable("#!/bin/sh\n")})
+	f.push(t, "main")
+	c1 := f.commit(t, "feature", []plumbing.Hash{main}, "edit script",
+		map[string]fileSpec{"README.md": regular("seed\n"), "run.sh": executable("#!/bin/sh\nedited\n")})
+
+	fake := newFake(t, f)
+	res, err := Push(context.Background(), fake, f.options("feature"))
+	if err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if len(res.Pairs) != 1 || res.Pairs[0].Local != c1.String() {
+		t.Fatalf("pairs = %+v, want one pair for %s", res.Pairs, c1)
+	}
+	files := map[string]fileSpec{}
+	remoteTip, err := f.remote.CommitObject(branchHash(t, f.remote, "feature"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	flattenTree(t, f.remote, remoteTip.TreeHash, "", files)
+	if files["run.sh"].mode != filemode.Executable {
+		t.Fatalf("remote run.sh mode = %v, want executable kept", files["run.sh"].mode)
 	}
 }
 

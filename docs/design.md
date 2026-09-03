@@ -35,8 +35,8 @@ Phase 1 is `push_verified.py`, a Python CLI spike that proves the semantics and 
 
 ## Tool boundary (rulings after G1/G2, 2026-09-03)
 
-- Error classification lives in `internal/tool`: `refused` (fix the commit or arguments), `retryable` (nothing landed), `partial` (N commits landed, a re-run resumes), `error`. Replay's typed errors stay unclassified; no string matching on messages.
-- `repo_path` is validated at the tool boundary: absolute, existing, symlinks resolved, inside a `--repo-root` allow-list that the server requires at launch.
+- Error classification lives in `internal/tool`: `refused` (fix the commit or arguments), `retryable` (a head race, nothing landed), `partial` (any failure after N>0 commits landed; a re-run resumes), `error` (anything else with nothing landed). Replay's typed errors stay unclassified; no string matching on messages. Revised 2026-09-03 after G3 review: `partial` is decided by the pair count, not the error type.
+- `repo_path` is validated at the tool boundary per ADR 0005: absolute, existing, symlinks resolved, inside a `--repo-root` allow-list that the server requires at launch; linked worktrees refused with the main tree named.
 - The commit byte ceiling default is owned by `internal/tool` and set from the Go re-measure; replay only enforces the number it is given.
 - Auth is an installation token minted immediately before each push and handed to go-git as basic auth; no supplier abstraction.
 
@@ -77,7 +77,8 @@ Same shape as the PSProxmoxVE remediation: one worktree agent per unit, model by
 | G1 Go module, go-git range walk, refusal set, blob reads, fetch + ref reset, partial-replay resume, table tests from P1/P3 | cross-cutting | Opus | `internal/replay/` | P3 |
 | G2 `ghinstallation` auth, GraphQL client, mutations | mechanical | Sonnet | `internal/github/` | P3 |
 | G3 MCP stdio server with one tool, wiring G1+G2, live DoD through an MCP client | cross-cutting | Opus | `cmd/mcp-server-github/`, `internal/tool/` | G1, G2 |
-| G4 Agent-contract update for PSProxmoxVE, `--exclude-tools` on the official server, ADR statuses to Accepted | code-owned | orchestrator drafts, operator approves | external repos | G3 |
+| G5 Fixes from the G3 review: empty-range panic, `partial` by pair count, userinfo refusal, single ceiling default | subtle runtime | Opus | `internal/replay/`, `internal/tool/` | G3 |
+| G4 Agent-contract update for PSProxmoxVE, `--exclude-tools` on the official server, ADR statuses to Accepted | code-owned | orchestrator drafts, operator approves | external repos | G5 |
 
 Waves: P1 and P2 in parallel, then P3 alone. G1 and G2 in parallel after P3, then G3 alone, then G4. Each agent gets the contract, the unit row, the DoD lines that apply, and runs `correctness-reviewer` plus `security-reviewer` synchronously; G1 and G3 add `architecture-reviewer`. Per-agent budget 350k tokens or two hours, then BLOCKED.
 

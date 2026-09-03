@@ -18,10 +18,6 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport"
 )
 
-// DefaultMaxCommitBytes is the ADR 0002 ceiling: the largest payload that
-// succeeded on every spike attempt, minus 10%.
-const DefaultMaxCommitBytes int64 = 7_200_000
-
 // RefusedError reports a commit or remote that createCommitOnBranch cannot
 // represent. Nothing has been mutated when it is returned.
 type RefusedError struct {
@@ -78,6 +74,8 @@ type Result struct {
 
 // Options configures Push. Auth is passed to every go-git network operation;
 // callers use &http.BasicAuth{Username: "x-access-token", Password: token}.
+// MaxCommitBytes has no default here: the ceiling is owned by the caller and a
+// non-positive value is an argument refusal.
 type Options struct {
 	RepoPath       string
 	Branch         string
@@ -100,17 +98,27 @@ func validateRefName(name, label string) error {
 // an error message.
 func redactURL(raw string) string {
 	if !strings.Contains(raw, "://") {
+		if m := scpRe.FindStringSubmatch(raw); m != nil && m[1] == sshUser {
+			return raw
+		}
+		// Anything before the last @ is userinfo in every form that reaches
+		// here, including the ones scpRe rejects for holding a password.
+		if i := strings.LastIndex(raw, "@"); i >= 0 {
+			return "<redacted>@" + raw[i+1:]
+		}
 		return raw
 	}
 	u, err := url.Parse(raw)
-	if err != nil {
+	// An opaque url keeps its userinfo inside Opaque, where clearing User
+	// cannot reach it.
+	if err != nil || u.Opaque != "" {
 		return "<unparseable url>"
 	}
 	u.User = nil
 	return u.String()
 }
 
-var scpRe = regexp.MustCompile(`^[A-Za-z0-9._-]+@([^:/]+):(.+)$`)
+var scpRe = regexp.MustCompile(`^([A-Za-z0-9._-]+)@([^:/]+):(.+)$`)
 
 // OwnerRepo resolves owner and repo from the configured URL of remote. Only
 // github.com over the ssh scp form, ssh:// or https:// is accepted.
@@ -147,6 +155,10 @@ func ownerRepoURL(repo *git.Repository, remote string) (string, string, string, 
 
 var repoSegmentRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
 
+// sshUser is the only userinfo github.com accepts over ssh; any other userinfo
+// is a credential the caller must not put in a remote url.
+const sshUser = "git"
+
 func parseRemoteURL(remote, raw string) (string, string, error) {
 	safe := redactURL(raw)
 	refuse := func(reason string) (string, string, error) {
@@ -159,7 +171,10 @@ func parseRemoteURL(remote, raw string) (string, string, error) {
 		if m == nil {
 			return refuse("is not a recognised git url")
 		}
-		host, path = m[1], m[2]
+		if m[1] != sshUser {
+			return refuse("carries credentials")
+		}
+		host, path = m[2], m[3]
 	} else {
 		u, err := url.Parse(raw)
 		if err != nil {
@@ -167,6 +182,12 @@ func parseRemoteURL(remote, raw string) (string, string, error) {
 		}
 		if u.Scheme != "ssh" && u.Scheme != "https" {
 			return refuse("uses unsupported scheme " + u.Scheme)
+		}
+		if u.User != nil {
+			_, hasPassword := u.User.Password()
+			if u.Scheme != "ssh" || hasPassword || u.User.Username() != sshUser {
+				return refuse("carries credentials")
+			}
 		}
 		if u.RawQuery != "" || u.Fragment != "" {
 			// go-git appends both to the endpoint path, so the string this
@@ -203,9 +224,6 @@ func (o Options) normalise() Options {
 	if o.Remote == "" {
 		o.Remote = "origin"
 	}
-	if o.MaxCommitBytes <= 0 {
-		o.MaxCommitBytes = DefaultMaxCommitBytes
-	}
 	return o
 }
 
@@ -220,6 +238,10 @@ func Push(ctx context.Context, c Client, o Options) (Result, error) {
 		if err := validateRefName(v.name, v.label); err != nil {
 			return Result{}, err
 		}
+	}
+	if o.MaxCommitBytes <= 0 {
+		return Result{}, &RefusedError{Reason: fmt.Sprintf(
+			"MaxCommitBytes must be positive, got %d", o.MaxCommitBytes)}
 	}
 
 	repo, err := git.PlainOpen(o.RepoPath)
@@ -275,8 +297,13 @@ func Push(ctx context.Context, c Client, o Options) (Result, error) {
 		return Result{}, err
 	}
 
-	if remoteHasBranch && len(pending) == 0 && len(adopted) == 0 {
-		return Result{Pairs: nil, Head: tracked.Hash().String()}, nil
+	if len(pending) == 0 && len(adopted) == 0 {
+		// Nothing to replay. When the remote lacks the branch there is nothing
+		// to place on it either, so no branch is created.
+		if remoteHasBranch {
+			return Result{Pairs: nil, Head: tracked.Hash().String()}, nil
+		}
+		return Result{Pairs: nil, Head: localTip.Hash().String()}, nil
 	}
 
 	changes := make([]*commitChange, 0, len(pending))

@@ -12,14 +12,14 @@ One tool, `push_verified(repo_path, branch, base="main", remote="origin")`, retu
 
 Phase 1 is `push_verified.py`, a Python CLI spike that proves the semantics and is then discarded. Phase 2 is the product: a Go stdio MCP server using go-git for every repository operation, no subprocess. See ADR 0004.
 
-## Flow
+## Flow (transport per ADR 0006; the numbered steps below predate it and stand except where noted)
 
 1. Resolve `owner/repo` from the remote URL. Refuse remotes that are not `github.com` or that carry userinfo. Transport always uses `https://github.com/<owner>/<repo>.git` with the installation token, whatever scheme the configured remote has; ssh origins are the norm and need no change.
 2. `git fetch origin <base> <branch>`. Compute `range = origin/<branch>..<branch>` if the remote branch exists, else `origin/<base>..<branch>`.
-3. For each commit in the range, oldest first: `git diff-tree -r --no-commit-id -M0 <parent> <commit>` gives paths, statuses, and modes. Any mode other than `100644`, any type change, any merge or empty commit: refuse (ADR 0002). Read blob contents via `git cat-file blob <oid>`, never from the working tree.
+3. For each commit in the range, oldest first, take the tree diff against its parent: paths, modes, blob hashes. Merge or empty commits: refuse. Read blob contents from the object store, never the working tree. (ADR 0006: modes are carried, not refused.)
 4. Mint an installation token (cached until 5 minutes before expiry).
-5. If the remote branch does not exist, `createRef` from the merge base of `<branch>` and `origin/<base>`, not the base tip.
-6. For each commit: `createCommitOnBranch` with `expectedHeadOid` = current remote head, additions and deletions from step 3, message = local subject and body. Record the returned OID as the new head.
+5. Upload every unique blob in the range once (`POST /git/blobs`), checking the returned SHA equals the local hash.
+6. For each commit: `POST /git/trees` with `base_tree` = the remote parent's tree and the changed entries with their modes (`sha: null` for deletions); `POST /git/commits` with message, tree, and the remote parent, no author or committer. Then one non-force `PATCH /git/refs/heads/<branch>` to the last commit; create the ref at the merge base first if the branch is new. A non-fast-forward rejection is the head race.
 7. `git fetch origin <branch>`; assert `git diff <local-tip> origin/<branch>` is empty; move the local ref (ADR 0003).
 8. Return the list of local to remote OID pairs and the final remote head.
 
@@ -29,7 +29,7 @@ Phase 1 is `push_verified.py`, a Python CLI spike that proves the semantics and 
 |---|---|
 | Remote head moved between fetch and mutation | `expectedHeadOid` mismatch; stop, report the commits already replayed, do not retry automatically |
 | Network failure mid-range | Stop, report the pairs already replayed. A re-run resumes: when the remote branch has commits the local branch lacks, compare them oldest-first against the local range by tree OID and commit message; if every remote-only commit matches a local one in order, adopt them (reset those local commits to the remote OIDs) and continue from the first unmatched local commit. Any mismatch is a refusal ("local branch is behind"). |
-| Mode change, new executable file, symlink, submodule (any entry with mode 160000, including its deletion), oversize | Refuse before the first mutation; the whole range is walked and every blob read before the first mutation is sent. Editing an existing executable is fine: the mutation keeps the entry's mode (ADR 0002) |
+| Merge commit, empty commit, blob over 100 MB | Refuse before the first upload; the whole range is walked first |
 | Local branch behind remote | Refuse; the agent has commits it did not push |
 | Nothing to push and the remote branch does not exist | Refuse naming branch and base; no branch is created, so a caller cannot open a PR from a branch that is not there |
 | Diff after replay non-empty | Hard error, local ref untouched |
@@ -79,7 +79,8 @@ Same shape as the PSProxmoxVE remediation: one worktree agent per unit, model by
 | G2 `ghinstallation` auth, GraphQL client, mutations | mechanical | Sonnet | `internal/github/` | P3 |
 | G3 MCP stdio server with one tool, wiring G1+G2, live DoD through an MCP client | cross-cutting | Opus | `cmd/mcp-server-github/`, `internal/tool/` | G1, G2 |
 | G5 Fixes from the G3 review: empty-range panic, `partial` by pair count, userinfo refusal, single ceiling default | subtle runtime | Opus | `internal/replay/`, `internal/tool/` | G3 |
-| G4 Agent-contract update for PSProxmoxVE, `--exclude-tools` on the official server, ADR statuses to Accepted | code-owned | orchestrator drafts, operator approves | external repos | G5 |
+| G6 Git Data transport (ADR 0006): blobs, trees, commits, ref update; delete GraphQL client and mode refusals; live DoD with chmod, new script, symlink; timing vs the GraphQL numbers | subtle runtime | Opus | `internal/github/`, `internal/replay/`, `internal/tool/` | G5 |
+| G4 Agent-contract update for PSProxmoxVE, `--exclude-tools` on the official server, ADR statuses to Accepted | code-owned | orchestrator drafts, operator approves | external repos | G6 |
 
 Waves: P1 and P2 in parallel, then P3 alone. G1 and G2 in parallel after P3, then G3 alone, then G4. Each agent gets the contract, the unit row, the DoD lines that apply, and runs `correctness-reviewer` plus `security-reviewer` synchronously; G1 and G3 add `architecture-reviewer`. Per-agent budget 350k tokens or two hours, then BLOCKED.
 

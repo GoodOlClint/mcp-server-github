@@ -1,6 +1,6 @@
 # ADR 0002 — Refuse rather than fall back when createCommitOnBranch cannot represent a commit
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR 0006](0006-git-data-api-for-every-push-replacing-createcommitonbranch.md)
 - **Date:** 2026-09-03
 - **Deciders:** operator + agent
 - **Context source:** `~/.claude/kickoffs/psproxmoxve-remediation/mcp-server-github-handoff-review.md`; operator interview 2026-09-03

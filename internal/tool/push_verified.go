@@ -43,7 +43,7 @@ const toolDescription = `Replaces "git push" for a branch: replays the local com
 LOUD CAVEATS, read before calling:
 - Every replayed commit is RE-AUTHORED as the GitHub App and gets a NEW OID; on success the local branch is RESET to the remote OIDs (the trees are identical, so the working tree and index do not change).
 - One GitHub API call per commit. A range of N commits is N mutations, and a failure part way through leaves the earlier commits on the remote; re-running resumes.
-- REFUSES, before sending anything, any commit that changes a file mode, adds or modifies a symlink or a submodule, is a merge commit, or exceeds the payload ceiling. Use a plain local "git push" for those.
+- REFUSES, before sending anything, any commit that changes a file mode, adds a new executable file, touches a symlink or a submodule, is a merge commit, or exceeds the payload ceiling. Editing an existing executable is fine; its mode is kept. Use a plain local "git push" for those.
 - "git commit" stays local and unchanged. This tool replaces the push, not the commit.
 - File content is read from the local git object database, never from the model.`
 

@@ -240,13 +240,18 @@ func changesFor(ctx context.Context, repo *git.Repository, c *object.Commit, max
 			out.deletions = append(out.deletions, path)
 			continue
 		}
-		if dstMode != filemode.Regular {
+		if dstMode != filemode.Regular && dstMode != filemode.Executable {
 			return nil, &RefusedError{OID: oid, Path: path, Reason: fmt.Sprintf(
 				"resulting mode %s is not a regular file", dstMode)}
 		}
-		if srcMode != filemode.Empty && srcMode != filemode.Regular {
+		// createCommitOnBranch carries no mode: a new entry lands as 100644 and
+		// a modified entry keeps the mode it already has on the remote.
+		if srcMode == filemode.Empty && dstMode == filemode.Executable {
+			return nil, &RefusedError{OID: oid, Path: path, Reason: "new file would lose its executable bit"}
+		}
+		if srcMode != filemode.Empty && srcMode != dstMode {
 			return nil, &RefusedError{OID: oid, Path: path, Reason: fmt.Sprintf(
-				"source mode %s is not a regular file", srcMode)}
+				"mode change %s to %s cannot be represented", srcMode, dstMode)}
 		}
 		size, err := blobSize(repo, ch.To.TreeEntry.Hash)
 		if err != nil {

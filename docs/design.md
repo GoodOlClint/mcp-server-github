@@ -29,7 +29,7 @@ Phase 1 is `push_verified.py`, a Python CLI spike that proves the semantics and 
 |---|---|
 | Remote head moved between fetch and mutation | `expectedHeadOid` mismatch; stop, report the commits already replayed, do not retry automatically |
 | Network failure mid-range | Stop, report the pairs already replayed. A re-run resumes: when the remote branch has commits the local branch lacks, compare them oldest-first against the local range by tree OID and commit message; if every remote-only commit matches a local one in order, adopt them (reset those local commits to the remote OIDs) and continue from the first unmatched local commit. Any mismatch is a refusal ("local branch is behind"). |
-| Resulting mode not 100644, symlink, submodule (any entry with mode 160000, including its deletion), oversize | Refuse before the first mutation; the whole range is walked and every blob read before the first mutation is sent |
+| Mode change, new executable file, symlink, submodule (any entry with mode 160000, including its deletion), oversize | Refuse before the first mutation; the whole range is walked and every blob read before the first mutation is sent. Editing an existing executable is fine: the mutation keeps the entry's mode (ADR 0002) |
 | Local branch behind remote | Refuse; the agent has commits it did not push |
 | Nothing to push and the remote branch does not exist | Refuse naming branch and base; no branch is created, so a caller cannot open a PR from a branch that is not there |
 | Diff after replay non-empty | Hard error, local ref untouched |

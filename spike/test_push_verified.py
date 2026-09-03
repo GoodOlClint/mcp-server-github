@@ -1,5 +1,6 @@
 import os
 import subprocess
+import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -317,3 +318,334 @@ def test_main_prints_usage_and_exits_2(capsys):
     assert pv.main([]) == 2
     captured = capsys.readouterr()
     assert "usage" in captured.err
+
+
+def test_commit_changes_allows_deleting_executable(repo):
+    _git(repo.clone, "checkout", "-b", "feature")
+    path = repo.clone / "run.sh"
+    path.write_text("#!/bin/sh\necho hi\n")
+    os.chmod(path, 0o755)
+    _git(repo.clone, "add", "run.sh")
+    _git(repo.clone, "commit", "-m", "add script")
+    path.unlink()
+    _git(repo.clone, "rm", "run.sh")
+    _git(repo.clone, "commit", "-m", "drop script")
+    oid = _git(repo.clone, "rev-parse", "HEAD").stdout.strip()
+    change = pv.commit_changes(str(repo.clone), oid)
+    assert change.additions == []
+    assert change.deletions == ["run.sh"]
+
+
+# -- push -------------------------------------------------------
+
+import gh  # noqa: E402
+
+
+_REPLAY_ENV = {
+    "GIT_AUTHOR_DATE": "2020-01-01T00:00:00",
+    "GIT_COMMITTER_DATE": "2020-01-01T00:00:00",
+}
+
+
+class FakeGraphQL:
+    """Replays mutations into a scratch clone of the bare remote.
+
+    Mirrors the gh.GraphQL surface push() uses, so the local reset and the
+    tree equality it asserts are exercised for real.
+    """
+
+    def __init__(
+        self, remote_path, work_dir, advance_at=None, advance_before_head=False, corrupt=False
+    ):
+        self.remote_path = remote_path
+        self.work_dir = work_dir
+        self.corrupt = corrupt
+        self.advance_at = advance_at
+        self.advance_before_head = advance_before_head
+        self.calls = []
+        self._clone = None
+        self._advanced = 0
+
+    def _advance_remote(self, branch):
+        """Lands a foreign commit on the remote branch, as a third party would."""
+        clone = self._mirror()
+        _git(clone, "checkout", "-B", branch, f"origin/{branch}")
+        self._advanced += 1
+        (clone / f"foreign{self._advanced}.txt").write_text("foreign\n")
+        _git(clone, "add", f"foreign{self._advanced}.txt")
+        _git(clone, "commit", "-m", "foreign commit", env=_REPLAY_ENV)
+        _git(clone, "push", "origin", branch)
+
+    def _mirror(self):
+        if self._clone is None:
+            self._clone = self.work_dir / "fake_remote_clone"
+            subprocess.run(
+                ["git", "clone", str(self.remote_path), str(self._clone)],
+                check=True,
+                capture_output=True,
+            )
+            _git(self._clone, "config", "user.name", "Bot")
+            _git(self._clone, "config", "user.email", "bot@example.com")
+        _git(self._clone, "fetch", "origin")
+        return self._clone
+
+    def repo_id(self, owner, repo):
+        self.calls.append(("repo_id", owner, repo))
+        return "R_fake"
+
+    def branch_head(self, owner, repo, branch):
+        self.calls.append(("branch_head", branch))
+        if self.advance_before_head:
+            self.advance_before_head = False
+            self._advance_remote(branch)
+        result = subprocess.run(
+            ["git", "-C", str(self.remote_path), "rev-parse", "--verify", f"refs/heads/{branch}"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip()
+
+    def create_branch(self, repo_id, branch, from_oid):
+        self.calls.append(("create_branch", branch, from_oid))
+        clone = self._mirror()
+        _git(clone, "branch", branch, from_oid)
+        _git(clone, "push", "origin", branch)
+        return from_oid
+
+    def create_commit(self, owner, repo, branch, expected_head_oid, message, additions, deletions):
+        self.calls.append(("create_commit", branch, expected_head_oid, message))
+        create_calls = sum(1 for c in self.calls if c[0] == "create_commit")
+        if self.advance_at == create_calls:
+            self._advance_remote(branch)
+        clone = self._mirror()
+        _git(clone, "checkout", "-B", branch, f"origin/{branch}")
+        head = _git(clone, "rev-parse", "HEAD").stdout.strip()
+        if head != expected_head_oid:
+            raise gh.GraphQLError(
+                [{"message": f"Expected branch to point to {expected_head_oid} but it did not"}]
+            )
+        for path in deletions:
+            (clone / path).unlink()
+            _git(clone, "rm", "--cached", path)
+        for path, content in additions:
+            full = clone / path
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_bytes(content + b"corrupt\n" if self.corrupt else content)
+            _git(clone, "add", path)
+        _git(clone, "commit", "-m", message, env=_REPLAY_ENV)
+        _git(clone, "push", "origin", branch)
+        return _git(clone, "rev-parse", "HEAD").stdout.strip()
+
+
+@pytest.fixture
+def fake_owner_repo(monkeypatch):
+    monkeypatch.setattr(pv, "owner_repo", lambda repo_path, remote="origin": ("someorg", "somerepo"))
+
+
+def _log_range(clone, spec):
+    return _git(clone, "log", "--format=%H", spec).stdout.split()
+
+
+def test_push_happy_path_two_commits(repo, tmp_path, fake_owner_repo):
+    _git(repo.clone, "checkout", "-b", "feature")
+    _commit(repo.clone, {"a.txt": "a\n"}, "seed feature")
+    _git(repo.clone, "push", "origin", "feature")
+    oid1 = _commit(repo.clone, {"a.txt": "a2\n"}, "change a")
+    oid2 = _commit(repo.clone, {"b.txt": "b\n"}, "add b\n\nbody")
+
+    fake = FakeGraphQL(repo.remote, tmp_path)
+    pairs = pv.push(str(repo.clone), "feature", "main", "origin", gql=fake)
+
+    assert [p[0] for p in pairs] == [oid1, oid2]
+    assert all(local != remote_oid for local, remote_oid in pairs)
+    assert not any(c[0] == "create_branch" for c in fake.calls)
+    assert sum(1 for c in fake.calls if c[0] == "create_commit") == 2
+
+    head = _git(repo.clone, "rev-parse", "feature").stdout.strip()
+    assert head == pairs[-1][1]
+    assert head == _git(repo.clone, "rev-parse", "origin/feature").stdout.strip()
+    assert _log_range(repo.clone, "origin/feature..feature") == []
+    assert _git(repo.clone, "diff", "origin/feature", check=False).stdout == ""
+
+
+def test_push_creates_remote_branch_when_absent(repo, tmp_path, fake_owner_repo):
+    _git(repo.clone, "checkout", "-b", "feature")
+    oid1 = _commit(repo.clone, {"a.txt": "a\n"}, "add a")
+
+    fake = FakeGraphQL(repo.remote, tmp_path)
+    pairs = pv.push(str(repo.clone), "feature", "main", "origin", gql=fake)
+
+    assert [p[0] for p in pairs] == [oid1]
+    created = [c for c in fake.calls if c[0] == "create_branch"]
+    assert len(created) == 1
+    main_oid = _git(repo.clone, "rev-parse", "origin/main").stdout.strip()
+    assert created[0][1:] == ("feature", main_oid)
+    assert _log_range(repo.clone, "origin/feature..feature") == []
+
+
+def test_push_head_mismatch_on_second_commit_reports_first_pair(repo, tmp_path, fake_owner_repo):
+    _git(repo.clone, "checkout", "-b", "feature")
+    oid1 = _commit(repo.clone, {"a.txt": "a\n"}, "add a")
+    _commit(repo.clone, {"b.txt": "b\n"}, "add b")
+    before = _git(repo.clone, "rev-parse", "feature").stdout.strip()
+
+    fake = FakeGraphQL(repo.remote, tmp_path, advance_at=2)
+    with pytest.raises(pv.SyncError) as excinfo:
+        pv.push(str(repo.clone), "feature", "main", "origin", gql=fake)
+
+    assert len(excinfo.value.pairs) == 1
+    assert excinfo.value.pairs[0][0] == oid1
+    assert excinfo.value.pairs[0][1] in str(excinfo.value)
+    assert sum(1 for c in fake.calls if c[0] == "create_commit") == 2
+    assert _git(repo.clone, "rev-parse", "feature").stdout.strip() == before
+
+
+def test_push_refusal_on_later_commit_sends_no_mutations(repo, tmp_path, fake_owner_repo):
+    _git(repo.clone, "checkout", "-b", "feature")
+    _commit(repo.clone, {"a.txt": "a\n"}, "add a")
+    script = repo.clone / "run.sh"
+    script.write_text("#!/bin/sh\n")
+    os.chmod(script, 0o755)
+    _git(repo.clone, "add", "run.sh")
+    _git(repo.clone, "commit", "-m", "add script")
+    before = _git(repo.clone, "rev-parse", "feature").stdout.strip()
+
+    fake = FakeGraphQL(repo.remote, tmp_path)
+    with pytest.raises(pv.RefusedError) as excinfo:
+        pv.push(str(repo.clone), "feature", "main", "origin", gql=fake)
+
+    assert "run.sh" in str(excinfo.value)
+    assert [c for c in fake.calls if c[0] in ("create_commit", "create_branch")] == []
+    assert _git(repo.clone, "rev-parse", "feature").stdout.strip() == before
+
+
+def test_push_rerun_after_success_sends_no_mutations(repo, tmp_path, fake_owner_repo):
+    _git(repo.clone, "checkout", "-b", "feature")
+    _commit(repo.clone, {"a.txt": "a\n"}, "add a")
+
+    fake = FakeGraphQL(repo.remote, tmp_path)
+    pv.push(str(repo.clone), "feature", "main", "origin", gql=fake)
+    mutations = [c for c in fake.calls if c[0] in ("create_commit", "create_branch")]
+
+    assert pv.push(str(repo.clone), "feature", "main", "origin", gql=fake) == []
+    assert [c for c in fake.calls if c[0] in ("create_commit", "create_branch")] == mutations
+
+
+def test_push_accepts_deletion_of_executable(repo, tmp_path, fake_owner_repo):
+    script = repo.clone / "run.sh"
+    script.write_text("#!/bin/sh\necho hi\n")
+    os.chmod(script, 0o755)
+    _git(repo.clone, "add", "run.sh")
+    _git(repo.clone, "commit", "-m", "add script")
+    _git(repo.clone, "push", "origin", "main")
+
+    _git(repo.clone, "checkout", "-b", "feature")
+    script.unlink()
+    _git(repo.clone, "rm", "run.sh")
+    _git(repo.clone, "commit", "-m", "drop script")
+    oid = _git(repo.clone, "rev-parse", "HEAD").stdout.strip()
+
+    fake = FakeGraphQL(repo.remote, tmp_path)
+    pairs = pv.push(str(repo.clone), "feature", "main", "origin", gql=fake)
+
+    assert [p[0] for p in pairs] == [oid]
+    assert _log_range(repo.clone, "origin/feature..feature") == []
+    listing = _git(repo.clone, "ls-tree", "--name-only", "origin/feature").stdout.split()
+    assert "run.sh" not in listing
+
+
+def test_commit_changes_refuses_oversize_additions(repo, monkeypatch):
+    _git(repo.clone, "checkout", "-b", "feature")
+    oid = _commit(repo.clone, {"big.bin": b"x" * 4096}, "add big")
+    monkeypatch.setattr(pv, "MAX_COMMIT_BYTES", 1024)
+    with pytest.raises(pv.RefusedError) as excinfo:
+        pv.commit_changes(str(repo.clone), oid)
+    assert "MAX_COMMIT_BYTES" in str(excinfo.value)
+
+
+def test_main_reports_github_request_failure_as_5(repo, monkeypatch, capsys):
+    def boom(*args, **kwargs):
+        raise urllib.error.URLError("write operation timed out")
+
+    monkeypatch.setattr(pv, "push", boom)
+    assert pv.main([str(repo.clone), "feature"]) == 5
+    assert "timed out" in capsys.readouterr().err
+
+
+def test_push_refuses_when_remote_moved_before_first_mutation(repo, tmp_path, fake_owner_repo):
+    _git(repo.clone, "checkout", "-b", "feature")
+    _commit(repo.clone, {"a.txt": "a\n"}, "seed feature")
+    _git(repo.clone, "push", "origin", "feature")
+    _commit(repo.clone, {"b.txt": "b\n"}, "add b")
+    before = _git(repo.clone, "rev-parse", "feature").stdout.strip()
+
+    fake = FakeGraphQL(repo.remote, tmp_path, advance_before_head=True)
+    with pytest.raises(pv.SyncError):
+        pv.push(str(repo.clone), "feature", "main", "origin", gql=fake)
+
+    assert [c for c in fake.calls if c[0] == "create_commit"] == []
+    assert _git(repo.clone, "rev-parse", "feature").stdout.strip() == before
+
+
+def test_push_creates_remote_branch_at_the_fork_point(repo, tmp_path, fake_owner_repo):
+    _git(repo.clone, "checkout", "-b", "feature")
+    fork_point = _git(repo.clone, "rev-parse", "origin/main").stdout.strip()
+    _commit(repo.clone, {"a.txt": "a\n"}, "add a")
+
+    other = _extra_clone(repo, "other_main_moved")
+    _commit(other, {"m.txt": "m\n"}, "main moves")
+    _git(other, "push", "origin", "main")
+
+    fake = FakeGraphQL(repo.remote, tmp_path)
+    pv.push(str(repo.clone), "feature", "main", "origin", gql=fake)
+
+    created = [c for c in fake.calls if c[0] == "create_branch"]
+    assert created[0][2] == fork_point
+    assert _git(repo.clone, "diff", "origin/feature", check=False).stdout == ""
+    assert _log_range(repo.clone, "origin/feature..feature") == []
+
+
+def test_main_exit_codes_for_refusal_and_sync(repo, monkeypatch, capsys):
+    def refuse(*args, **kwargs):
+        raise pv.RefusedError("path 'run.sh' has disallowed dst mode 100755")
+
+    monkeypatch.setattr(pv, "push", refuse)
+    assert pv.main([str(repo.clone), "feature"]) == 3
+    assert "run.sh" in capsys.readouterr().err
+
+    def desync(*args, **kwargs):
+        raise pv.SyncError("head moved", [("local", "remote")])
+
+    monkeypatch.setattr(pv, "push", desync)
+    assert pv.main([str(repo.clone), "feature"]) == 4
+    assert "head moved" in capsys.readouterr().err
+
+
+def test_main_reports_git_failure_without_traceback(repo, capsys, fake_owner_repo):
+    assert pv.main([str(repo.clone), "no-such-branch"]) == 2
+    assert "git command failed" in capsys.readouterr().err
+
+
+def test_main_reports_missing_repo_path(tmp_path, capsys):
+    assert pv.main([str(tmp_path / "nope"), "feature"]) == 2
+    assert "cannot run git" in capsys.readouterr().err
+
+
+def test_main_refuses_non_github_remote_before_fetching(repo, capsys):
+    assert pv.main([str(repo.clone), "feature"]) == 3
+    assert "cannot parse remote url" in capsys.readouterr().err
+
+
+def test_push_reports_pairs_when_the_local_reset_fails(repo, tmp_path, fake_owner_repo):
+    _git(repo.clone, "checkout", "-b", "feature")
+    oid = _commit(repo.clone, {"a.txt": "a\n"}, "add a")
+    before = _git(repo.clone, "rev-parse", "feature").stdout.strip()
+
+    fake = FakeGraphQL(repo.remote, tmp_path, corrupt=True)
+    with pytest.raises(pv.SyncError) as excinfo:
+        pv.push(str(repo.clone), "feature", "main", "origin", gql=fake)
+
+    assert [p[0] for p in excinfo.value.pairs] == [oid]
+    assert _git(repo.clone, "rev-parse", "feature").stdout.strip() == before

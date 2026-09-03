@@ -22,3 +22,21 @@ When a commit in the range contains a mode change, a non-regular-file entry, or 
 
 - Shell-script PRs and anything touching modes stay on local push until GitHub adds a mode field to the mutation.
 - The payload ceiling is measured against the target repo's largest file before the spike is called done, and the number is recorded here.
+- Deletions carry no content, so a deletion is representable whatever the deleted file's mode was. The refusal covers entries whose destination mode is neither `100644` nor absent, and modifications whose source mode is not `100644`; deleting an executable or a symlink is allowed.
+- Measured ceiling, P3 spike, 2026-09-03, pushing generated random-byte files to `GoodOlClint/PSProxmoxVE` from the operator's workstation (raw addition bytes; the request carries about 1.34x that after base64):
+
+  | Payload | Attempts | Result |
+  |---|---|---|
+  | 1 MB | 1 | ok, 6 s |
+  | 5 MB | 4 | ok, 6 to 9 s |
+  | 8 MB | 3 | ok, 8 to 11 s |
+  | 10 MB | 4 | 2 ok, 2 failed with `HTTP 499` |
+  | 15 MB | 2 | both failed with `HTTP 499` |
+  | 20 MB | 2 | 1 ok (31 s), 1 failed with `HTTP 499` |
+  | 40 MB | 1 | client-side `urlopen error The write operation timed out` at the 30 s request timeout |
+  | 200 files, ~15 B each, one commit | 1 | ok, 5 s |
+
+  Exact text of the first failure: `github error: GraphQL request failed: HTTP 499: ` (empty response body; 499 is the edge closing the connection).
+
+- `MAX_COMMIT_BYTES` is `7_200_000`, the largest size that succeeded on every attempt (8 MB) minus 10%. The failure is time-correlated rather than a hard byte limit, so the number encodes the operator's upstream bandwidth as much as GitHub's limit; a faster link would push it higher, and the Go port should re-measure rather than inherit it.
+- The count of files in a commit is not a constraint at the scale that matters here: 200 additions in one mutation succeeded in 5 s.

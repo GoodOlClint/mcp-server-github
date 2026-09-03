@@ -33,6 +33,13 @@ Phase 1 is `push_verified.py`, a Python CLI spike that proves the semantics and 
 | Local branch behind remote | Refuse; the agent has commits it did not push |
 | Diff after replay non-empty | Hard error, local ref untouched |
 
+## Tool boundary (rulings after G1/G2, 2026-09-03)
+
+- Error classification lives in `internal/tool`: `refused` (fix the commit or arguments), `retryable` (nothing landed), `partial` (N commits landed, a re-run resumes), `error`. Replay's typed errors stay unclassified; no string matching on messages.
+- `repo_path` is validated at the tool boundary: absolute, existing, symlinks resolved, inside a `--repo-root` allow-list that the server requires at launch.
+- The commit byte ceiling default is owned by `internal/tool` and set from the Go re-measure; replay only enforces the number it is given.
+- Auth is an installation token minted immediately before each push and handed to go-git as basic auth; no supplier abstraction.
+
 ## Auth
 
 `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY_PATH`, identical to the official server. No PAT path. The App needs Contents read and write, which it already has.

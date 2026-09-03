@@ -528,6 +528,27 @@ func TestClassify(t *testing.T) {
 			wantPairs: 2,
 		},
 		{
+			name:      "client error after commits landed",
+			res:       replay.Result{Pairs: pairs},
+			err:       errors.New("network exploded"),
+			wantKind:  KindPartial,
+			wantPairs: 2,
+		},
+		{
+			name:      "refusal after commits landed",
+			res:       replay.Result{Pairs: pairs},
+			err:       &replay.RefusedError{Reason: "mode change"},
+			wantKind:  KindPartial,
+			wantPairs: 2,
+		},
+		{
+			name:      "head mismatch after commits landed",
+			res:       replay.Result{Pairs: pairs},
+			err:       &replay.HeadMismatchError{Expected: "abc", Message: "stale"},
+			wantKind:  KindPartial,
+			wantPairs: 2,
+		},
+		{
 			name:     "head mismatch",
 			err:      &replay.HeadMismatchError{Expected: "abc", Message: "stale"},
 			wantKind: KindError,

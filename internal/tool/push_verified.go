@@ -253,24 +253,25 @@ func classify(res replay.Result, err error) Output {
 		return Output{Kind: KindSuccess, Pairs: pairs, Head: res.Head}
 	}
 
+	var sync *replay.SyncError
+	isSync := errors.As(err, &sync)
+	if len(pairs) == 0 && isSync {
+		pairs = toPairs(sync.Replayed)
+	}
+
+	// Commits reached GitHub, so the outcome is resumable whatever failed next.
+	if len(pairs) > 0 {
+		return Output{Kind: KindPartial, Message: err.Error(), Pairs: pairs}
+	}
+
 	var refused *replay.RefusedError
 	if errors.As(err, &refused) {
-		return Output{Kind: KindRefused, Message: err.Error(), Pairs: pairs}
+		return Output{Kind: KindRefused, Message: err.Error()}
 	}
-
-	var sync *replay.SyncError
-	if errors.As(err, &sync) {
-		kind := KindRetryable
-		if len(sync.Replayed) > 0 {
-			kind = KindPartial
-			if len(pairs) == 0 {
-				pairs = toPairs(sync.Replayed)
-			}
-		}
-		return Output{Kind: kind, Message: err.Error(), Pairs: pairs}
+	if isSync {
+		return Output{Kind: KindRetryable, Message: err.Error()}
 	}
-
-	return Output{Kind: KindError, Message: err.Error(), Pairs: pairs}
+	return Output{Kind: KindError, Message: err.Error()}
 }
 
 // refusal marks a boundary error as policy rather than a filesystem failure, so

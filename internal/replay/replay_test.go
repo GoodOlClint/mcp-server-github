@@ -253,6 +253,7 @@ type fixture struct {
 	remote    *git.Repository
 	remoteDir string
 	seed      plumbing.Hash
+	epPath    string
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -291,7 +292,7 @@ func newFixture(t *testing.T) *fixture {
 	}
 
 	entry.client = local
-	f := &fixture{local: local, localPath: localPath, remote: remote, remoteDir: remoteDir}
+	f := &fixture{local: local, localPath: localPath, remote: remote, remoteDir: remoteDir, epPath: epPath}
 	f.seed = f.commit(t, "main", nil, "seed", map[string]fileSpec{"README.md": regular("seed\n")})
 	if err := local.Storer.SetReference(plumbing.NewSymbolicReference(
 		plumbing.HEAD, plumbing.NewBranchReferenceName("main"))); err != nil {
@@ -345,10 +346,22 @@ func (f *fixture) push(t *testing.T, branch string) {
 }
 
 func (f *fixture) options(branch string) Options {
-	return Options{RepoPath: f.localPath, Branch: branch, Base: "main", Remote: "origin"}
+	return Options{RepoPath: f.localPath, Branch: branch, Base: "main", Remote: "origin",
+		MaxCommitBytes: testMaxCommitBytes}
+}
+
+// unserve makes every network operation on the fixture remote fail, so a test
+// can prove a check runs before the first fetch.
+func (f *fixture) unserve() {
+	loaderMu.Lock()
+	delete(loaderBy, f.epPath)
+	loaderMu.Unlock()
 }
 
 // -- fake client -----------------------------------------------------------
+
+// testMaxCommitBytes is the ceiling the tool passes; replay has no default.
+const testMaxCommitBytes int64 = 4_718_592
 
 var botSig = object.Signature{
 	Name: "Bot", Email: "bot@example.com", When: time.Unix(1500000000, 0).UTC(),
@@ -495,6 +508,18 @@ func TestOwnerRepo(t *testing.T) {
 		{name: "space in owner", url: "https://github.com/a b/c", refuse: "does not look like owner/repo"},
 		{name: "query string", url: "https://github.com/o/r?x=1", refuse: "query or fragment"},
 		{name: "explicit port", url: "https://github.com:8443/o/r", refuse: "names a port"},
+		{name: "https with password", url: "https://someuser:somepassword@github.com/o/r.git",
+			refuse: "carries credentials"},
+		{name: "https with username only", url: "https://ghs_sometoken@github.com/o/r.git",
+			refuse: "carries credentials"},
+		{name: "ssh url with another user", url: "ssh://mallory@github.com/o/r.git",
+			refuse: "carries credentials"},
+		{name: "ssh url with password", url: "ssh://git:somepassword@github.com/o/r.git",
+			refuse: "carries credentials"},
+		{name: "scp form with another user", url: "mallory@github.com:o/r.git",
+			refuse: "carries credentials"},
+		{name: "https with git as user", url: "https://git@github.com/o/r.git",
+			refuse: "carries credentials"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -547,6 +572,93 @@ func TestOwnerRepoRedactsCredentials(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "gitlab.com") {
 		t.Fatalf("want the host named: %s", err)
+	}
+}
+
+func TestOwnerRepoRefusesGitHubURLWithUserinfo(t *testing.T) {
+	const password = "ghs_supersecretpassword"
+	for _, tc := range []struct{ name, url string }{
+		{"https with password", "https://someuser:" + password + "@github.com/someorg/somerepo.git"},
+		{"https with token as user", "https://" + password + "@github.com/someorg/somerepo.git"},
+		{"ssh url with password", "ssh://git:" + password + "@github.com/someorg/somerepo.git"},
+		{"scp form with token as user", password + "@github.com:someorg/somerepo.git"},
+		{"scp form with password", "git:" + password + "@github.com:someorg/somerepo.git"},
+		{"schemeless with password", "https:/someuser:" + password + "@github.com/someorg/somerepo.git"},
+		{"opaque url with password", "https:x://someuser:" + password + "@github.com/someorg/somerepo.git"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			repo, err := git.PlainInit(dir, false)
+			if err != nil {
+				t.Fatalf("init: %v", err)
+			}
+			if _, err := repo.CreateRemote(&config.RemoteConfig{
+				Name: "origin", URLs: []string{tc.url}}); err != nil {
+				t.Fatalf("create remote: %v", err)
+			}
+			_, _, err = OwnerRepo(dir, "origin")
+			var refused *RefusedError
+			if !errors.As(err, &refused) {
+				t.Fatalf("want RefusedError, got %v", err)
+			}
+			if strings.Contains(refused.Error(), password) || strings.Contains(refused.Error(), "someuser") {
+				t.Fatalf("credentials leaked: %s", refused.Error())
+			}
+		})
+	}
+}
+
+func TestPushEmptyRangeWithoutRemoteBranchCreatesNothing(t *testing.T) {
+	f := newFixture(t)
+	setBranch(t, f.local, "feature", f.seed)
+
+	fake := newFake(t, f)
+	res, err := Push(context.Background(), fake, f.options("feature"))
+	if err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if len(res.Pairs) != 0 {
+		t.Fatalf("want zero pairs, got %+v", res.Pairs)
+	}
+	if res.Head != f.seed.String() {
+		t.Fatalf("head = %q, want the local tip %s", res.Head, f.seed)
+	}
+	for _, c := range fake.calls {
+		if c.kind == "create_branch" || c.kind == "create_commit" {
+			t.Fatalf("want no mutation, got %+v", fake.calls)
+		}
+	}
+	if branchHash(t, f.local, "feature") != f.seed {
+		t.Fatal("local ref moved")
+	}
+	if _, err := f.remote.Reference(plumbing.NewBranchReferenceName("feature"), true); err == nil {
+		t.Fatal("remote branch was created")
+	}
+}
+
+func TestPushRefusesNonPositiveMaxCommitBytesBeforeFetching(t *testing.T) {
+	f := newFixture(t)
+	f.commit(t, "feature", []plumbing.Hash{f.seed}, "add a",
+		map[string]fileSpec{"README.md": regular("seed\n"), "a.txt": regular("a\n")})
+	// With the remote unserved every fetch fails, so only a check made before
+	// the first one can produce the refusal.
+	f.unserve()
+
+	for _, max := range []int64{0, -1} {
+		fake := newFake(t, f)
+		o := f.options("feature")
+		o.MaxCommitBytes = max
+		_, err := Push(context.Background(), fake, o)
+		var refused *RefusedError
+		if !errors.As(err, &refused) {
+			t.Fatalf("max %d: want RefusedError, got %v", max, err)
+		}
+		if !strings.Contains(refused.Reason, "MaxCommitBytes") {
+			t.Fatalf("max %d: want the option named, got %q", max, refused.Reason)
+		}
+		if len(fake.calls) != 0 {
+			t.Fatalf("max %d: want no client calls, got %+v", max, fake.calls)
+		}
 	}
 }
 
@@ -808,7 +920,7 @@ func TestPushRefusals(t *testing.T) {
 				f.commit(t, "feature", []plumbing.Hash{f.seed}, "add big",
 					with(map[string]fileSpec{"big.bin": regularBytes(make([]byte, 4096))}))
 			},
-			reason: "MaxCommitBytes",
+			reason: "exceeds MaxCommitBytes",
 			max:    1024,
 		},
 		{
@@ -839,7 +951,9 @@ func TestPushRefusals(t *testing.T) {
 
 			fake := newFake(t, f)
 			o := f.options("feature")
-			o.MaxCommitBytes = tc.max
+			if tc.max > 0 {
+				o.MaxCommitBytes = tc.max
+			}
 			_, err := Push(context.Background(), fake, o)
 
 			var refused *RefusedError

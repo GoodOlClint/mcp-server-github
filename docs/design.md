@@ -14,7 +14,7 @@ Phase 1 is `push_verified.py`, a Python CLI spike that proves the semantics and 
 
 ## Flow
 
-1. Resolve `owner/repo` from the remote URL. Refuse remotes that are not `github.com`.
+1. Resolve `owner/repo` from the remote URL. Refuse remotes that are not `github.com` or that carry userinfo. Transport always uses `https://github.com/<owner>/<repo>.git` with the installation token, whatever scheme the configured remote has; ssh origins are the norm and need no change.
 2. `git fetch origin <base> <branch>`. Compute `range = origin/<branch>..<branch>` if the remote branch exists, else `origin/<base>..<branch>`.
 3. For each commit in the range, oldest first: `git diff-tree -r --no-commit-id -M0 <parent> <commit>` gives paths, statuses, and modes. Any mode other than `100644`, any type change, any merge or empty commit: refuse (ADR 0002). Read blob contents via `git cat-file blob <oid>`, never from the working tree.
 4. Mint an installation token (cached until 5 minutes before expiry).
@@ -31,6 +31,7 @@ Phase 1 is `push_verified.py`, a Python CLI spike that proves the semantics and 
 | Network failure mid-range | Stop, report the pairs already replayed. A re-run resumes: when the remote branch has commits the local branch lacks, compare them oldest-first against the local range by tree OID and commit message; if every remote-only commit matches a local one in order, adopt them (reset those local commits to the remote OIDs) and continue from the first unmatched local commit. Any mismatch is a refusal ("local branch is behind"). |
 | Resulting mode not 100644, symlink, submodule (any entry with mode 160000, including its deletion), oversize | Refuse before the first mutation; the whole range is walked and every blob read before the first mutation is sent |
 | Local branch behind remote | Refuse; the agent has commits it did not push |
+| Nothing to push and the remote branch does not exist | Refuse naming branch and base; no branch is created, so a caller cannot open a PR from a branch that is not there |
 | Diff after replay non-empty | Hard error, local ref untouched |
 
 ## Tool boundary (rulings after G1/G2, 2026-09-03)

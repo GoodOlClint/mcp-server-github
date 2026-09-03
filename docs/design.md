@@ -8,7 +8,7 @@ Remediation agents on PSProxmoxVE push through `push_files`, which needs full fi
 
 ## Shape
 
-One tool, `push_verified(repo_path, branch, base="main", remote="origin")`, returning the local-to-remote OID pairs and the final remote head. Agents commit locally as today. The tool replays `origin/<base>..<branch>` onto GitHub one `createCommitOnBranch` per commit, then resets the local branch to the remote OIDs. See ADR 0001, 0003.
+One tool, `push_verified(repo_path, branch, base="main", remote="origin")`, returning the local-to-remote OID pairs and the final remote head. Agents commit locally as today. The tool replays `origin/<base>..<branch>` onto GitHub through the Git Data API, one tree and one commit per local commit plus one blob per unique file version, then resets the local branch to the remote OIDs. See ADR 0001, 0003, 0006.
 
 Phase 1 is `push_verified.py`, a Python CLI spike that proves the semantics and is then discarded. Phase 2 is the product: a Go stdio MCP server using go-git for every repository operation, no subprocess. See ADR 0004.
 
@@ -19,7 +19,7 @@ Phase 1 is `push_verified.py`, a Python CLI spike that proves the semantics and 
 3. For each commit in the range, oldest first (topological), take the tree diff against its first parent: paths, modes, blob hashes. Empty commits: refuse. Merge commits are carried with all parents (ADR 0006). Read blob contents from the object store, never the working tree. (ADR 0006: modes are carried, not refused.)
 4. Mint an installation token (cached until 5 minutes before expiry).
 5. Upload every unique blob in the range once (`POST /git/blobs`), checking the returned SHA equals the local hash.
-6. For each commit: `POST /git/trees` with `base_tree` = the remote parent's tree and the changed entries with their modes (`sha: null` for deletions); `POST /git/commits` with message, tree, and the remote parent, no author or committer. Then one non-force `PATCH /git/refs/heads/<branch>` to the last commit; create the ref at the merge base first if the branch is new. A non-fast-forward rejection is the head race.
+6. For each commit: `POST /git/trees` with `base_tree` = the remote parent's tree and the changed entries with their modes (`sha: null` for deletions); `POST /git/commits` with message, tree, and the remote parent, no author or committer. Then one non-force `PATCH /git/refs/heads/<branch>` to the last commit, or `POST /git/refs` at the last commit if the branch is new, so no empty branch ever exists on the remote. A non-fast-forward rejection, or a 422 because the ref appeared concurrently, is the head race.
 7. `git fetch origin <branch>`; assert `git diff <local-tip> origin/<branch>` is empty; move the local ref (ADR 0003).
 8. Return the list of local to remote OID pairs and the final remote head.
 
@@ -27,7 +27,7 @@ Phase 1 is `push_verified.py`, a Python CLI spike that proves the semantics and 
 
 | Case | Behaviour |
 |---|---|
-| Remote head moved between fetch and mutation | `expectedHeadOid` mismatch; stop, report the commits already replayed, do not retry automatically |
+| Remote head moved between fetch and ref update | The fast-forward check rejects the ref update; nothing landed on the branch (the created objects are unreferenced); report `retryable`, do not retry automatically |
 | Network failure mid-range | Stop, report the pairs already replayed. A re-run resumes: when the remote branch has commits the local branch lacks, compare them oldest-first against the local range by tree OID and commit message; if every remote-only commit matches a local one in order, adopt them (reset those local commits to the remote OIDs) and continue from the first unmatched local commit. Any mismatch is a refusal ("local branch is behind"). |
 | Empty commit, a parent neither on the remote nor in the range, blob over 100 MB | Refuse before the first upload; the whole range is walked first |
 | Remote has no base branch (empty repository) | Replay from the root commit; create the ref at the first replayed commit |
@@ -89,4 +89,4 @@ Live-push units (P3, G3) need the App PEM at `~/.config/github-agent/claude.pem`
 
 Resolved 2026-09-03: the repo `GoodOlClint/mcp-server-github` exists; an installation token cannot create personal-account repos, so the operator created it. Spike units merged locally; Go units dogfood `push_verified`.
 
-Spike findings carried into the Go units: the measured ceiling is time-bound (HTTP 499 from the edge, 30 s client timeout), so G2 uses a 120 s request timeout and G3 re-measures; `expectedHeadOid` compares against the ref the range was computed from; `HeadMismatchError` is a typed error, not a string match; replay and github packages share only an interface and a fake client for tests.
+Spike findings carried into the Go units: `HeadMismatchError` is a typed error, not a string match; replay and github packages share only an interface and a fake client for tests. The GraphQL-era ceiling findings are superseded by ADR 0006: the limit is 24 MiB per blob (GitHub answers a 401 above 32 MiB of base64) and 50 MB per commit by default.

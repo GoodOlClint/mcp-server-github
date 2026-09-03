@@ -1,10 +1,10 @@
 # mcp-server-github
 
-Pushes local git commits to GitHub as Verified commits through `createCommitOnBranch`, reading file content from the local repo so none passes through the model.
+Pushes local git commits to GitHub as Verified commits through the Git Data REST API, reading file content from the local repo so none passes through the model.
 
 ## Architecture
 
-Go, go-git for every repo operation (no `os/exec`), `ghinstallation` App auth, `net/http` GraphQL, `modelcontextprotocol/go-sdk` stdio server. Layout: `cmd/mcp-server-github` (flags, launch), `internal/tool` (MCP tool, boundary validation, error kinds, ceiling default), `internal/replay` (go-git walk, refusal set, replay, local ref sync), `internal/github` (App auth, Git Data REST client). The Python spike that proved the semantics was deleted on 2026-09-03; its measurements live in ADR 0002. Design and work split: `docs/design.md`.
+Go, go-git for every repo operation (no `os/exec`), `ghinstallation` App auth, `net/http` REST client, `modelcontextprotocol/go-sdk` stdio server. Layout: `cmd/mcp-server-github` (flags, launch), `internal/tool` (MCP tool, boundary validation, error kinds, ceiling default), `internal/replay` (go-git walk, refusal set, replay, local ref sync), `internal/github` (App auth, Git Data REST client). The Python spike that proved the semantics was deleted on 2026-09-03; its measurements live in ADR 0002. Design and work split: `docs/design.md`.
 
 ## Canonical pipelines
 

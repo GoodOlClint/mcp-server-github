@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-mcp-server-github
+/mcp-server-github
 .worktrees/
 scratch/

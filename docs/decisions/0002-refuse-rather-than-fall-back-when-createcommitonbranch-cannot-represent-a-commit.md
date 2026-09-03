@@ -40,3 +40,21 @@ When a commit in the range contains a mode change, a non-regular-file entry, or 
 
 - `MAX_COMMIT_BYTES` is `7_200_000`, the largest size that succeeded on every attempt (8 MB) minus 10%. The failure is time-correlated rather than a hard byte limit, so the number encodes the operator's upstream bandwidth as much as GitHub's limit; a faster link would push it higher, and the Go port should re-measure rather than inherit it.
 - The count of files in a commit is not a constraint at the scale that matters here: 200 additions in one mutation succeeded in 5 s.
+
+- Go re-measure, G3, 2026-09-03, same repo and workstation, driven through the stdio MCP server with a 120 s request timeout and the ceiling raised out of the way. Sizes are MiB of random bytes in a single added file:
+
+  | Payload | Attempts | Ok | Result |
+  |---|---|---|---|
+  | 3 MiB | 2 | 2 | ok, 4 s |
+  | 4 MiB | 2 | 2 | ok, 6 to 9 s |
+  | 5 MiB | 6 | 6 | ok, 6 to 14 s |
+  | 6 MiB | 6 | 4 | 2 failed with `HTTP 499` |
+  | 7 MiB | 6 | 5 | 1 failed with `HTTP 499` |
+  | 8 MiB | 6 | 4 | 2 failed with `HTTP 499` |
+  | 10 MiB | 6 | 4 | 2 failed with `HTTP 499` |
+  | 15 MiB | 2 | 1 | 1 failed with `HTTP 499` |
+  | 20 MiB | 2 | 0 | both failed with `HTTP 499` |
+  | 30 MiB | 2 | 0 | both failed with `HTTP 499` |
+
+- Every Go failure was `github: graphql request failed: HTTP 499: ` with an empty body, and every one of them landed between 5.9 s and 6.3 s of wall clock regardless of payload size, while the successes ran 4 s to 21 s. That is an edge cutting the connection on a roughly fixed deadline, not a byte limit: the 120 s client timeout is never reached, and raising it cannot help. Size only sets the probability of crossing the deadline.
+- `tool.DefaultMaxCommitBytes` is `4_718_592`, 5 MiB (the largest size that succeeded on every Go attempt) minus 10%. It is lower than the spike's `7_200_000` because the uplink was slower on the re-measure day, which is the same conclusion the spike reached: this number tracks the operator's bandwidth, not a GitHub limit, so it should be re-measured rather than inherited. It lives in `internal/tool` and reaches the engine through `replay.Options.MaxCommitBytes`.

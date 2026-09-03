@@ -27,5 +27,5 @@ Run `correctness-reviewer` and `security-reviewer` on your diff, synchronously (
 ## 5. Commit and report
 
 - One commit on your branch, conventional-commit message, body explaining the why. Author and committer come from the environment; do not set them.
-- Do not push. The orchestrator merges local branches until the remote exists.
+- Do not push. The orchestrator merges local branches and pushes `main`; the PR loop starts with the Go units, which push through `push_verified` itself.
 - Your final message is all the orchestrator sees. Lead with DONE (commit sha, branch) or BLOCKED (why). Then: files touched, test counts, mutation-test evidence, reviewers run and findings acted on or rejected, out-of-scope notes.

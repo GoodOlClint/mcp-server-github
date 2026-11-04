@@ -45,6 +45,7 @@ func main() {
 	timeout := fs.Duration("timeout", 120*time.Second, "per-request timeout for GitHub API calls")
 	maxCommitBytes := fs.Int64("max-commit-bytes", tool.DefaultMaxCommitBytes,
 		"per-commit ceiling on uploaded bytes; the measurement behind the default is in ADR 0006 and depends on the uplink")
+	bindRepo := fs.String("bind-repo", "", "owner/repo; when set, push_verified refuses any other destination before any network call")
 	// flag.ExitOnError already exits on a parse failure.
 	_ = fs.Parse(os.Args[1:])
 	if len(roots) == 0 {
@@ -58,12 +59,12 @@ func main() {
 		log.Fatal("--max-commit-bytes must be positive")
 	}
 
-	if err := run(roots, *endpoint, *timeout, *maxCommitBytes); err != nil {
+	if err := run(roots, *endpoint, *timeout, *maxCommitBytes, *bindRepo); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run(roots []string, endpoint string, timeout time.Duration, maxCommitBytes int64) error {
+func run(roots []string, endpoint string, timeout time.Duration, maxCommitBytes int64, bindRepo string) error {
 	appID, installationID, keyPath, err := github.FromEnv()
 	if err != nil {
 		return err
@@ -84,6 +85,7 @@ func run(roots []string, endpoint string, timeout time.Duration, maxCommitBytes 
 		Transport:      rt,
 		Roots:          roots,
 		MaxCommitBytes: maxCommitBytes,
+		BindRepo:       bindRepo,
 	})
 	if err != nil {
 		return err

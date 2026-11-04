@@ -54,6 +54,7 @@ The same three variables the official GitHub MCP server uses for App auth. There
 | Flag | Default | Meaning |
 |---|---|---|
 | `--repo-root` | none | Directory a `repo_path` may resolve inside. Repeatable. **Required**: with no root, no path is accepted. |
+| `--bind-repo` | none | `owner/repo` (case-insensitive). When set, a push whose remote resolves to any other repository is refused before any network call. Unset: the destination is whatever the remote says. |
 | `--endpoint` | `https://api.github.com` | REST API root. |
 | `--timeout` | `120s` | Per-request timeout for GitHub API calls. |
 | `--max-commit-bytes` | `52428800` (50 MB), see ADR 0006 | Per-commit ceiling on uploaded bytes. It tracks the uplink, not a GitHub limit, so re-measure rather than inherit it. |

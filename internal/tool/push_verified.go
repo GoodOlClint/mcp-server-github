@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/GoodOlClint/mcp-server-github/internal/github"
@@ -81,6 +82,7 @@ type Config struct {
 	Transport      http.RoundTripper
 	Roots          []string
 	MaxCommitBytes int64
+	BindRepo       string
 }
 
 // Server holds the resolved configuration behind the push_verified handler.
@@ -88,6 +90,7 @@ type Server struct {
 	client         replay.Client
 	roots          []string
 	maxCommitBytes int64
+	bindRepo       string
 	auth           func(context.Context) (transport.AuthMethod, error)
 	push           func(context.Context, replay.Client, replay.Options) (replay.Result, error)
 }
@@ -124,8 +127,12 @@ func New(cfg Config) (*Server, error) {
 	if max <= 0 {
 		max = DefaultMaxCommitBytes
 	}
+	if cfg.BindRepo != "" && !bindRepoRe.MatchString(cfg.BindRepo) {
+		return nil, fmt.Errorf("tool: bind repo %q must be owner/repo", cfg.BindRepo)
+	}
 	rt := cfg.Transport
 	return &Server{
+		bindRepo:       cfg.BindRepo,
 		client:         cfg.Client,
 		roots:          roots,
 		maxCommitBytes: max,
@@ -138,6 +145,24 @@ func New(cfg Config) (*Server, error) {
 		},
 		push: replay.Push,
 	}, nil
+}
+
+var bindRepoRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}$`)
+
+// checkBound refuses a destination other than the bound repository. It runs
+// before the token mint, so a refusal makes no network call.
+func (s *Server) checkBound(repoPath, remote string) error {
+	if s.bindRepo == "" {
+		return nil
+	}
+	owner, name, err := replay.OwnerRepo(repoPath, remote)
+	if err != nil {
+		return refusef("cannot confirm the destination is %s: %v", s.bindRepo, err)
+	}
+	if !strings.EqualFold(owner+"/"+name, s.bindRepo) {
+		return refusef("destination %s/%s is not the bound repository %s", owner, name, s.bindRepo)
+	}
+	return nil
 }
 
 func resolveDir(p string) (string, error) {
@@ -231,6 +256,10 @@ func (s *Server) run(ctx context.Context, in Input) (out Output) {
 
 	repoPath, err := s.resolveRepoPath(in.RepoPath)
 	if err != nil {
+		return Output{Kind: kindFor(err), Message: err.Error()}
+	}
+
+	if err := s.checkBound(repoPath, in.Remote); err != nil {
 		return Output{Kind: kindFor(err), Message: err.Error()}
 	}
 
